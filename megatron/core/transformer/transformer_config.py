@@ -747,9 +747,9 @@ class TransformerConfig(ModelParallelConfig):
     specified capacity, similar to GShard, Switch-Transformer, and DeepSpeed-MoE. Note that this is
     currently unsupported so should remain False."""
 
-    moe_token_dispatcher_type: Literal['allgather', 'alltoall', 'flex'] = "allgather"
+    moe_token_dispatcher_type: Literal['allgather', 'alltoall', 'flex', 'stream'] = "allgather"
     """The type of token dispatcher to use. The default is 'allgather'.
-    Options are 'allgather','alltoall' and 'flex'."""
+    Options are 'allgather','alltoall', 'flex', and 'stream'."""
 
     moe_enable_deepep: bool = False
     """[Experimental] Enable DeepEP for efficient token dispatching and combine in MoE models."""
@@ -1445,6 +1445,37 @@ class TransformerConfig(ModelParallelConfig):
             if "moe" not in self.recompute_modules:
                 self.recompute_modules.append("moe")
 
+        if self.moe_token_dispatcher_type == "stream":
+            if self.moe_shared_expert_intermediate_size is not None:
+                raise ValueError("StreamMoE v1 does not support shared experts.")
+            if self.moe_latent_size is not None:
+                raise ValueError("StreamMoE v1 does not support moe_latent_size.")
+            if self.moe_shared_expert_overlap:
+                raise ValueError("StreamMoE v1 does not support shared expert overlap.")
+            if self.overlap_moe_expert_parallel_comm:
+                raise ValueError(
+                    "StreamMoE v1 does not support overlap_moe_expert_parallel_comm."
+                )
+            if self.moe_expert_capacity_factor is not None:
+                raise ValueError(
+                    "StreamMoE v1 does not support token dropping or expert capacity."
+                )
+            if self.moe_pad_expert_input_to_capacity:
+                raise ValueError("StreamMoE v1 does not support expert input padding.")
+            if self.moe_router_padding_for_quantization:
+                raise ValueError("StreamMoE v1 does not support router padding for quantization.")
+            if self.transformer_impl == "inference_optimized":
+                raise ValueError("StreamMoE v1 only supports training mode.")
+            if self.cuda_graph_impl != "none":
+                raise ValueError("StreamMoE v1 does not support CUDA graph execution.")
+            if self.moe_apply_probs_on_input:
+                raise ValueError("StreamMoE v1 does not support moe_apply_probs_on_input.")
+            if self.recompute_granularity != "selective" or "moe" not in self.recompute_modules:
+                raise ValueError(
+                    "StreamMoE v1 requires MoE recompute. "
+                    "Use --recompute-granularity selective --recompute-modules moe."
+                )
+
         if self.fine_grained_activation_offloading:
             assert (
                 not self.cpu_offloading
@@ -1870,9 +1901,9 @@ class TransformerConfig(ModelParallelConfig):
                     "fp8/fp4 must be specified when moe_router_padding_for_quantization is True."
                 )
 
-            if self.moe_token_dispatcher_type in ["allgather", "alltoall_seq"]:
+            if self.moe_token_dispatcher_type in ["allgather", "alltoall_seq", "stream"]:
                 raise ValueError(
-                    "allgather and alltoall_seq dispatcher does not support "
+                    "allgather, alltoall_seq, and stream dispatchers do not support "
                     "moe_router_padding_for_quantization."
                 )
 

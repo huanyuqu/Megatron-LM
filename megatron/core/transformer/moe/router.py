@@ -227,6 +227,45 @@ class TopKRouter(Router):
             if self.expert_bias.dtype != torch.float32:
                 self.expert_bias.data = self.expert_bias.data.to(torch.float32)
 
+    def _top_indices_to_routing_map(
+        self, top_indices: torch.LongTensor, logits: torch.Tensor
+    ) -> torch.BoolTensor:
+        """Convert compact top-k indices back to a dense bool routing map."""
+
+        rows = torch.arange(top_indices.shape[0], device=top_indices.device).unsqueeze(1)
+        if torch.are_deterministic_algorithms_enabled():
+            routing_map = torch.zeros_like(logits, dtype=logits.dtype)
+            routing_map.index_put_(
+                (rows, top_indices),
+                torch.ones_like(top_indices, dtype=routing_map.dtype),
+                accumulate=False,
+            )
+            return routing_map.bool()
+        return torch.zeros_like(logits).int().scatter(1, top_indices, 1).bool()
+
+    def _sinkhorn_load_balancing_with_indices(
+        self, logits: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.LongTensor]:
+        """Compact sinkhorn routing output for StreamMoE."""
+
+        def _sinkhorn_activation(logits):
+            if self.topk == 1:
+                logits = torch.sigmoid(logits)
+            else:
+                logits = torch.softmax(logits, dim=-1, dtype=torch.float32).type_as(logits)
+            return logits
+
+        if self.training:
+            with torch.no_grad():
+                norm_logits = sinkhorn(logits.to(dtype=torch.float32))
+                _, top_indices = torch.topk(norm_logits, k=self.topk, dim=1)
+            scores = _sinkhorn_activation(logits)
+        else:
+            scores = _sinkhorn_activation(logits)
+            _, top_indices = torch.topk(scores, k=self.topk, dim=1)
+        probs = torch.gather(scores, dim=1, index=top_indices)
+        return probs, top_indices
+
     def sinkhorn_load_balancing(self, logits: torch.Tensor):
         """Apply sinkhorn routing to the logits tensor.
 
@@ -672,6 +711,80 @@ class TopKRouter(Router):
 
         return probs, routing_map
 
+    def routing_with_indices(
+        self, logits: torch.Tensor, padding_mask: Optional[torch.Tensor] = None
+    ) -> tuple[torch.Tensor, torch.LongTensor]:
+        """Compact top-k routing output for StreamMoE.
+
+        Returns:
+            probs: [num_tokens, topk]
+            top_indices: [num_tokens, topk]
+        """
+
+        seq_length, bsz = logits.shape[:2]
+        logits = logits.view(-1, self.config.num_moe_experts)
+
+        if padding_mask is not None:
+            padding_mask = padding_mask.reshape(-1)
+
+        logits = self.apply_z_loss(logits, padding_mask=padding_mask)
+
+        if self.config.moe_expert_capacity_factor is not None:
+            raise ValueError(
+                "Compact StreamMoE routing does not support token dropping or expert capacity."
+            )
+
+        if self.routing_type == "sinkhorn":
+            probs, top_indices = self._sinkhorn_load_balancing_with_indices(logits)
+        else:
+            probs, top_indices = topk_routing_with_score_function(
+                logits,
+                self.topk,
+                use_pre_softmax=self.config.moe_router_pre_softmax,
+                num_groups=self.config.moe_router_num_groups,
+                group_topk=self.config.moe_router_group_topk,
+                scaling_factor=self.config.moe_router_topk_scaling_factor,
+                score_function=self.score_function,
+                expert_bias=self.expert_bias,
+                fused=self.config.moe_router_fusion,
+                router_replay=self.router_replay,
+                dense_output=True,
+            )
+
+        routing_map = self._top_indices_to_routing_map(top_indices, logits)
+
+        if self.training and torch.is_grad_enabled() and self.is_aux_loss_enabled():
+            routing_map_for_aux_loss, scores_for_aux_loss = compute_routing_scores_for_aux_loss(
+                logits,
+                self.topk,
+                self.score_function,
+                fused=self.config.moe_router_fusion,
+                padding_mask=padding_mask,
+            )
+            probs = self._apply_aux_loss(
+                probs,
+                scores_for_aux_loss,
+                routing_map_for_aux_loss,
+                with_padding_mask=padding_mask is not None,
+            )
+            probs = self._apply_seq_aux_loss(
+                probs,
+                scores_for_aux_loss,
+                routing_map_for_aux_loss,
+                seq_length,
+                bsz,
+                with_padding_mask=padding_mask is not None,
+            )
+            probs = self._apply_global_aux_loss(
+                probs,
+                scores_for_aux_loss,
+                routing_map_for_aux_loss,
+                with_padding_mask=padding_mask is not None,
+            )
+
+        self._apply_expert_bias(routing_map, padding_mask=padding_mask)
+        return probs, top_indices
+
     def reset_global_aux_loss_tracker(self):
         """Reset the global aux loss tracker."""
         if self.global_tokens_per_expert is not None:
@@ -707,6 +820,27 @@ class TopKRouter(Router):
         probs, routing_map = self.routing(logits, padding_mask=padding_mask)
 
         return probs, routing_map
+
+    def forward_with_indices(
+        self, input: torch.Tensor, padding_mask: Optional[torch.Tensor] = None
+    ) -> tuple[torch.Tensor, torch.LongTensor]:
+        """Forward pass that returns compact top-k routing."""
+
+        self._maintain_float32_expert_bias()
+
+        input = self.apply_input_jitter(input)
+        logits = self.gating(input)
+
+        if self.config.moe_router_force_load_balancing:
+            logits = apply_random_logits(logits)
+
+        if self.config.moe_router_force_biased is not None:
+            logits = apply_biased_logits(
+                logits, self.config.moe_router_force_biased, self.layer_number
+            )
+
+        probs, top_indices = self.routing_with_indices(logits, padding_mask=padding_mask)
+        return probs, top_indices
 
     def _load_from_state_dict(self, *args, **kwargs):
         """Load the state dict of the router."""

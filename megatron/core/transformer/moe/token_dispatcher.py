@@ -931,6 +931,109 @@ class MoEAlltoAllTokenDispatcher(MoETokenDispatcher):
         return tokens_per_expert
 
 
+class MoEStreamAlltoAllTokenDispatcherV1(MoEAlltoAllTokenDispatcher):
+    """Round-wise StreamMoE dispatcher built on top of the all-to-all EP path.
+
+    This v1 dispatcher keeps the existing all-to-all expert execution flow, but changes the
+    routing representation from dense [num_tokens, num_experts] multi-hot routing maps to one
+    compact expert assignment per token for the current round.
+    """
+
+    def _preprocess_compact(
+        self, expert_indices: torch.LongTensor, probs: torch.Tensor
+    ) -> torch.Tensor:
+        """Compute all metadata for one compact StreamMoE round."""
+
+        num_local_tokens_per_expert = torch.bincount(
+            expert_indices, minlength=self.num_experts
+        ).long()
+
+        self.num_out_tokens = expert_indices.numel()
+        if self.ep_size > 1 or self.tp_size > 1:
+            self.input_splits = num_local_tokens_per_expert.reshape(
+                self.ep_size, self.num_local_experts
+            ).sum(axis=1)
+            num_global_tokens_per_expert = (
+                gather_from_sequence_parallel_region(
+                    num_local_tokens_per_expert, group=self.tp_ep_group
+                )
+                .reshape(self.ep_size, self.tp_size, self.num_experts)
+                .transpose(0, 1)
+            )
+            num_global_tokens_per_local_expert = num_global_tokens_per_expert[
+                :, :, self.local_expert_indices[0] : self.local_expert_indices[-1] + 1
+            ].contiguous()
+            num_global_tokens_per_rank = num_global_tokens_per_local_expert.sum(axis=2)
+            self.output_splits = num_global_tokens_per_rank[self.tp_rank]
+            self.output_splits_tp = num_global_tokens_per_rank.sum(axis=1)
+            num_tokens_per_local_expert = num_global_tokens_per_local_expert.sum(dim=(0, 1))
+            self._maybe_update_cuda_sync_point("before_ep_alltoall")
+        else:
+            num_global_tokens_per_local_expert = num_local_tokens_per_expert.reshape(
+                self.num_experts
+            )
+            num_tokens_per_local_expert = num_local_tokens_per_expert
+            self._maybe_update_cuda_sync_point("before_finish")
+
+        if self.num_local_experts > 1:
+            self.num_global_tokens_per_local_expert = num_global_tokens_per_local_expert.view(
+                -1, self.num_local_experts
+            )
+            if not self.config.moe_permute_fusion:
+                self._maybe_update_cuda_sync_point("before_permutation_2")
+
+        assert (
+            self.cuda_sync_point_priority[self.cuda_dtoh_point]
+            <= self.cuda_sync_point_priority[self.cuda_sync_point]
+        ), "cuda_sync_point must be after cuda_dtoh_point."
+        return num_tokens_per_local_expert
+
+    def dispatch_preprocess(
+        self,
+        hidden_states: torch.Tensor,
+        routing_map: torch.Tensor,
+        probs: torch.Tensor,
+    ):
+        """Preprocess one compact StreamMoE round.
+
+        Args:
+            hidden_states: [seq, batch, hidden] or [num_tokens, hidden]
+            routing_map: [num_tokens] compact expert indices for the current round.
+            probs: [num_tokens] compact gate weights for the current round.
+        """
+
+        self.hidden_shape = hidden_states.shape
+        hidden_states = hidden_states.view(-1, self.hidden_shape[-1])
+        expert_indices = routing_map.reshape(-1).to(torch.long)
+        probs = probs.reshape(-1)
+        if hidden_states.shape[0] != expert_indices.numel():
+            raise ValueError(
+                "StreamMoE round expert indices must have one entry per token, "
+                f"got {expert_indices.numel()} indices for {hidden_states.shape[0]} tokens."
+            )
+        if probs.numel() != expert_indices.numel():
+            raise ValueError(
+                "StreamMoE round probs must have one value per token, "
+                f"got {probs.numel()} probs for {expert_indices.numel()} token assignments."
+            )
+
+        self.probs = probs
+        self.routing_map = None
+        self.tokens_per_expert = self._preprocess_compact(expert_indices, probs)
+        self.tokens_per_expert = self._maybe_dtoh_and_synchronize(
+            "before_permutation_1", self.tokens_per_expert
+        )
+        self.hidden_shape_before_permute = hidden_states.shape
+        self.reversed_local_input_permutation_mapping = torch.argsort(
+            expert_indices, descending=False, stable=True
+        )
+        permutated_local_input_tokens = hidden_states.index_select(
+            0, self.reversed_local_input_permutation_mapping
+        )
+        permuted_probs = probs.index_select(0, self.reversed_local_input_permutation_mapping)
+        return permutated_local_input_tokens, permuted_probs
+
+
 class _DispatchManager(ABC):
     """
     A manager class to handle dispatch and combine processes for MoE models.

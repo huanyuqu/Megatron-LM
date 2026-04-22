@@ -18,11 +18,13 @@ from megatron.core.transformer.moe.moe_utils import (
     get_default_pg_collection,
     maybe_skip_or_early_return_by_cudagraph,
 )
+from megatron.core.transformer.moe.stream_planner import build_stream_round_plan
 from megatron.core.transformer.moe.router import TopKRouter
 from megatron.core.transformer.moe.token_dispatcher import (
     MoEAllGatherTokenDispatcher,
     MoEAlltoAllTokenDispatcher,
     MoEFlexTokenDispatcher,
+    MoEStreamAlltoAllTokenDispatcherV1,
     MoETokenDispatcher,
 )
 from megatron.core.transformer.moe.token_dispatcher_inference import (
@@ -121,6 +123,12 @@ class RouterInterface(Protocol):
 
         Called from transformer_layer during initialization.
         """
+        ...
+
+    def forward_with_indices(
+        self, input: torch.Tensor, /, padding_mask: torch.Tensor | None = None
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Forward pass returning compact top-k outputs for StreamMoE."""
         ...
 
 
@@ -287,6 +295,13 @@ class MoELayer(BaseMoELayer):
                 config=self.config,
                 pg_collection=pg_collection,
             )
+        elif config.moe_token_dispatcher_type == "stream":
+            self.token_dispatcher = MoEStreamAlltoAllTokenDispatcherV1(
+                self.num_local_experts,
+                self.local_expert_indices,
+                config=self.config,
+                pg_collection=pg_collection,
+            )
         elif config.moe_token_dispatcher_type == "flex":
             self.token_dispatcher = MoEFlexTokenDispatcher(
                 self.num_local_experts,
@@ -347,6 +362,41 @@ class MoELayer(BaseMoELayer):
 
         # Setup events and streams for delayed wgrad computation.
         self.setup_delayed_wgrad_for_dispatch_backward_overlap()
+
+    def _validate_stream_mode(self) -> None:
+        """Validate StreamMoE runtime-only constraints."""
+
+        if self.config.moe_token_dispatcher_type != "stream":
+            return
+        if self.config.moe_shared_expert_intermediate_size is not None:
+            raise ValueError("StreamMoE v1 does not support shared experts.")
+        if self.config.moe_latent_size is not None:
+            raise ValueError("StreamMoE v1 does not support moe_latent_size.")
+        if self.config.moe_shared_expert_overlap:
+            raise ValueError("StreamMoE v1 does not support shared expert overlap.")
+        if self.config.overlap_moe_expert_parallel_comm:
+            raise ValueError("StreamMoE v1 does not support overlap_moe_expert_parallel_comm.")
+        if self.config.moe_expert_capacity_factor is not None:
+            raise ValueError("StreamMoE v1 does not support token dropping or expert capacity.")
+        if self.config.moe_pad_expert_input_to_capacity:
+            raise ValueError("StreamMoE v1 does not support padding experts to capacity.")
+        if self.config.moe_router_padding_for_quantization:
+            raise ValueError("StreamMoE v1 does not support router padding for quantization.")
+        if self.config.transformer_impl == "inference_optimized":
+            raise ValueError("StreamMoE v1 only supports training mode.")
+        if self.config.cuda_graph_impl != "none":
+            raise ValueError("StreamMoE v1 does not support CUDA graph execution.")
+        if self.config.moe_apply_probs_on_input:
+            raise ValueError("StreamMoE v1 does not support moe_apply_probs_on_input.")
+        if not (
+            self.config.recompute_granularity == "selective"
+            and self.config.recompute_modules is not None
+            and "moe" in self.config.recompute_modules
+        ):
+            raise ValueError(
+                "StreamMoE v1 requires MoE recompute. "
+                "Use --recompute-granularity selective --recompute-modules moe."
+            )
 
     def _setup_inference_mode(self, pg_collection):
         """Set up inference-optimized token dispatcher and state.
@@ -420,6 +470,13 @@ class MoELayer(BaseMoELayer):
         """
         probs, routing_map = apply_module(self.router)(hidden_states, padding_mask)
         return probs, routing_map
+
+    def route_compact(
+        self, hidden_states: torch.Tensor, padding_mask: Optional[torch.Tensor] = None
+    ):
+        """Compact top-k routing for StreamMoE."""
+
+        return apply_module(self.router).forward_with_indices(hidden_states, padding_mask)
 
     @maybe_skip_or_early_return_by_cudagraph("preprocess")
     def preprocess(
@@ -533,6 +590,23 @@ class MoELayer(BaseMoELayer):
             output = output + shared_expert_output
         return output
 
+    def _stream_round_forward(
+        self,
+        hidden_states: torch.Tensor,
+        round_probs: torch.Tensor,
+        round_expert_indices: torch.LongTensor,
+    ) -> torch.Tensor:
+        """One StreamMoE round using the compact stream dispatcher."""
+
+        hidden_states, round_probs = self.token_dispatcher.dispatch_preprocess(
+            hidden_states, round_expert_indices, round_probs
+        )
+        dispatched_input, dispatched_probs = self.dispatch(hidden_states, round_probs)
+        output, mlp_bias = self.routed_experts_compute(dispatched_input, dispatched_probs)
+        assert mlp_bias is None, f"mlp_bias is not supported for {type(self.token_dispatcher)}"
+        output = self.combine(output)
+        return self.token_dispatcher.combine_postprocess(output)
+
     def router_and_preprocess(self, hidden_states: torch.Tensor):
         """This method is a combined method of route and preprocess. Deprecated."""
 
@@ -570,6 +644,52 @@ class MoELayer(BaseMoELayer):
         # Transpose from [bsz, seq_length] to [seq_length, bsz] to align with hidden_states
         if padding_mask is not None:
             padding_mask = padding_mask.transpose(0, 1).bool()
+
+        self._validate_stream_mode()
+
+        if self.config.moe_token_dispatcher_type == "stream":
+            if not self.training:
+                raise ValueError("StreamMoE v1 only supports training mode.")
+            if intermediate_tensors is not None:
+                raise ValueError("StreamMoE v1 does not support intermediate_tensors.")
+
+            def custom_stream_forward(hidden_states, intermediate_tensors=None, padding_mask=None):
+                topk_probs, topk_indices = self.route_compact(hidden_states, padding_mask)
+                round_plan = build_stream_round_plan(topk_probs, topk_indices)
+                accumulated_output = None
+
+                for round_assignment in round_plan.rounds:
+                    round_output = self._stream_round_forward(
+                        hidden_states,
+                        round_assignment.probs,
+                        round_assignment.expert_indices,
+                    )
+                    accumulated_output = (
+                        round_output
+                        if accumulated_output is None
+                        else accumulated_output + round_output
+                    )
+
+                return accumulated_output, None
+
+            if self.moe_layer_recompute and self.training:
+                if self.config.fp8 or self.config.fp4:
+                    outputs = te_checkpoint(
+                        custom_stream_forward,
+                        False,
+                        tensor_parallel.random.get_cuda_rng_tracker,
+                        parallel_state.get_tensor_model_parallel_group(),
+                        hidden_states,
+                        intermediate_tensors,
+                        padding_mask,
+                    )
+                else:
+                    outputs = tensor_parallel.checkpoint(
+                        custom_stream_forward, False, hidden_states, intermediate_tensors, padding_mask
+                    )
+            else:
+                outputs = custom_stream_forward(hidden_states, intermediate_tensors, padding_mask)
+            return outputs
 
         # MoE forward: route -> dispatch -> compute -> combine
         def custom_forward(hidden_states, intermediate_tensors=None, padding_mask=None):

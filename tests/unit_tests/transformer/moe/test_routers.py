@@ -102,6 +102,25 @@ class TestTop2Router:
 
     @pytest.mark.internal
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+    def test_router_forward_with_indices_matches_dense_selection(self):
+        with torch.no_grad():
+            self.router = self.router.cuda()
+            hidden_states = torch.randn((32, 2, self.router.config.hidden_size), device="cuda")
+            hidden_states = hidden_states.bfloat16()
+
+            dense_probs, dense_routing_map = self.router(hidden_states)
+            compact_probs, compact_indices = self.router.forward_with_indices(hidden_states)
+
+            dense_selected_probs = torch.gather(dense_probs, dim=1, index=compact_indices)
+            compact_routing_map = self.router._top_indices_to_routing_map(
+                compact_indices, dense_probs
+            )
+
+            torch.testing.assert_close(dense_selected_probs, compact_probs)
+            assert torch.equal(dense_routing_map, compact_routing_map)
+
+    @pytest.mark.internal
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
     def test_aux_loss(self):
         self.sequential_mlp = self.sequential_mlp.cuda()
 
