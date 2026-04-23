@@ -607,6 +607,36 @@ class MoELayer(BaseMoELayer):
         output = self.combine(output)
         return self.token_dispatcher.combine_postprocess(output)
 
+    def _checkpoint_stream_round(
+        self,
+        hidden_states: torch.Tensor,
+        round_probs: torch.Tensor,
+        round_expert_indices: torch.LongTensor,
+    ) -> torch.Tensor:
+        """Run one StreamMoE round with an activation checkpoint boundary."""
+
+        if not (self.moe_layer_recompute and self.training):
+            return self._stream_round_forward(hidden_states, round_probs, round_expert_indices)
+
+        if self.config.fp8 or self.config.fp4:
+            return te_checkpoint(
+                self._stream_round_forward,
+                False,
+                tensor_parallel.random.get_cuda_rng_tracker,
+                parallel_state.get_tensor_model_parallel_group(),
+                hidden_states,
+                round_probs,
+                round_expert_indices,
+            )
+
+        return tensor_parallel.checkpoint(
+            self._stream_round_forward,
+            False,
+            hidden_states,
+            round_probs,
+            round_expert_indices,
+        )
+
     def router_and_preprocess(self, hidden_states: torch.Tensor):
         """This method is a combined method of route and preprocess. Deprecated."""
 
@@ -653,43 +683,21 @@ class MoELayer(BaseMoELayer):
             if intermediate_tensors is not None:
                 raise ValueError("StreamMoE v1 does not support intermediate_tensors.")
 
-            def custom_stream_forward(hidden_states, intermediate_tensors=None, padding_mask=None):
-                topk_probs, topk_indices = self.route_compact(hidden_states, padding_mask)
-                round_plan = build_stream_round_plan(topk_probs, topk_indices)
-                accumulated_output = None
+            topk_probs, topk_indices = self.route_compact(hidden_states, padding_mask)
+            round_plan = build_stream_round_plan(topk_probs, topk_indices)
+            accumulated_output = None
 
-                for round_assignment in round_plan.rounds:
-                    round_output = self._stream_round_forward(
-                        hidden_states,
-                        round_assignment.probs,
-                        round_assignment.expert_indices,
-                    )
-                    accumulated_output = (
-                        round_output
-                        if accumulated_output is None
-                        else accumulated_output + round_output
-                    )
+            for round_assignment in round_plan.rounds:
+                round_output = self._checkpoint_stream_round(
+                    hidden_states,
+                    round_assignment.probs,
+                    round_assignment.expert_indices,
+                )
+                accumulated_output = (
+                    round_output if accumulated_output is None else accumulated_output + round_output
+                )
 
-                return accumulated_output, None
-
-            if self.moe_layer_recompute and self.training:
-                if self.config.fp8 or self.config.fp4:
-                    outputs = te_checkpoint(
-                        custom_stream_forward,
-                        False,
-                        tensor_parallel.random.get_cuda_rng_tracker,
-                        parallel_state.get_tensor_model_parallel_group(),
-                        hidden_states,
-                        intermediate_tensors,
-                        padding_mask,
-                    )
-                else:
-                    outputs = tensor_parallel.checkpoint(
-                        custom_stream_forward, False, hidden_states, intermediate_tensors, padding_mask
-                    )
-            else:
-                outputs = custom_stream_forward(hidden_states, intermediate_tensors, padding_mask)
-            return outputs
+            return accumulated_output, None
 
         # MoE forward: route -> dispatch -> compute -> combine
         def custom_forward(hidden_states, intermediate_tensors=None, padding_mask=None):

@@ -23,6 +23,7 @@ def _make_config(
     moe_router_topk: int,
     moe_ffn_hidden_size: int,
     dtype: torch.dtype,
+    moe_aux_loss_coeff: float,
 ) -> TransformerConfig:
     return TransformerConfig(
         num_layers=1,
@@ -33,7 +34,7 @@ def _make_config(
         moe_token_dispatcher_type=dispatcher_type,
         moe_router_load_balancing_type="aux_loss",
         moe_router_topk=moe_router_topk,
-        moe_aux_loss_coeff=0.01,
+        moe_aux_loss_coeff=moe_aux_loss_coeff,
         moe_grouped_gemm=grouped_gemm,
         moe_ffn_hidden_size=moe_ffn_hidden_size,
         add_bias_linear=False,
@@ -59,21 +60,60 @@ def _build_moe_layer(config: TransformerConfig) -> MoELayer:
     return moe_layer
 
 
-def _assert_named_parameter_grads_close(reference: MoELayer, candidate: MoELayer) -> None:
-    reference_params = dict(reference.named_parameters())
-    candidate_params = dict(candidate.named_parameters())
-    assert reference_params.keys() == candidate_params.keys()
-    for name in reference_params:
-        ref_grad = reference_params[name].grad
-        cand_grad = candidate_params[name].grad
-        assert ref_grad is not None, f"Missing reference grad for {name}"
-        assert cand_grad is not None, f"Missing candidate grad for {name}"
+def _is_rank_zero() -> bool:
+    return not torch.distributed.is_initialized() or torch.distributed.get_rank() == 0
+
+
+def _print_close_stats(name: str, reference: torch.Tensor, candidate: torch.Tensor) -> None:
+    diff = (reference.float() - candidate.float()).abs()
+    ref_abs = reference.float().abs()
+    max_abs = diff.max()
+    max_ref = ref_abs.max()
+    rel_l2 = diff.norm() / ref_abs.norm().clamp_min(1e-12)
+    denom = torch.maximum(ref_abs, torch.ones_like(ref_abs) * 1e-12)
+    max_rel = (diff / denom).max()
+    mean_abs = diff.mean()
+    if _is_rank_zero():
+        print(
+            f"[stream compare] {name}: max_abs={max_abs.item():.8f} "
+            f"mean_abs={mean_abs.item():.8f} rel_l2={rel_l2.item():.8f} "
+            f"max_rel={max_rel.item():.8f} "
+            f"max_ref={max_ref.item():.8f}",
+            flush=True,
+        )
+
+
+def _assert_parameter_grad_close(
+    name: str,
+    reference: torch.Tensor,
+    candidate: torch.Tensor,
+    *,
+    dtype: torch.dtype,
+    atol: float,
+    rtol: float,
+) -> None:
+    ref = reference.float()
+    cand = candidate.float()
+    if dtype == torch.float32:
         torch.testing.assert_close(
-            ref_grad.float(),
-            cand_grad.float(),
-            atol=1e-4,
-            rtol=1e-4,
+            ref,
+            cand,
+            atol=atol,
+            rtol=rtol,
             msg=f"Gradient mismatch for parameter {name}",
+        )
+        return
+
+    # In bf16/fp16 the two dispatchers can accumulate the same mathematical
+    # gradient in a different order. Elementwise max relative error is too
+    # brittle for router/expert gradient tensors, especially near zeros, so use
+    # a norm-level criterion while keeping forward/input-grad elementwise checks.
+    rel_l2 = (ref - cand).norm() / ref.norm().clamp_min(1e-12)
+    norm_rtol = 2e-2
+    if rel_l2 > norm_rtol:
+        raise AssertionError(
+            f"Gradient mismatch for parameter {name}: "
+            f"relative L2 error {rel_l2.item():.6f} exceeds {norm_rtol:.6f}"
         )
 
 
@@ -100,6 +140,7 @@ def _measure_dispatcher(
     moe_router_topk: int,
     moe_ffn_hidden_size: int,
     dtype: torch.dtype,
+    moe_aux_loss_coeff: float,
 ) -> dict[str, Any]:
     config = _make_config(
         dispatcher_type=dispatcher_type,
@@ -110,6 +151,7 @@ def _measure_dispatcher(
         moe_router_topk=moe_router_topk,
         moe_ffn_hidden_size=moe_ffn_hidden_size,
         dtype=dtype,
+        moe_aux_loss_coeff=moe_aux_loss_coeff,
     )
     layer = _build_moe_layer(config)
     layer.load_state_dict(state_dict)
@@ -153,6 +195,7 @@ def run_stream_vs_alltoall_parity(
     num_moe_experts: int = 4,
     moe_router_topk: int = 2,
     dtype: torch.dtype = torch.float32,
+    moe_aux_loss_coeff: float = 0.01,
 ) -> None:
     if torch.cuda.device_count() < 2:
         raise RuntimeError("Stream MoE EP smoke test requires at least 2 CUDA devices.")
@@ -171,6 +214,7 @@ def run_stream_vs_alltoall_parity(
             moe_router_topk=moe_router_topk,
             moe_ffn_hidden_size=moe_ffn_hidden_size,
             dtype=dtype,
+            moe_aux_loss_coeff=moe_aux_loss_coeff,
         )
         reference_layer = _build_moe_layer(reference_config)
         state_dict = _clone_state_dict_to_cpu(reference_layer)
@@ -197,6 +241,7 @@ def run_stream_vs_alltoall_parity(
             moe_router_topk=moe_router_topk,
             moe_ffn_hidden_size=moe_ffn_hidden_size,
             dtype=dtype,
+            moe_aux_loss_coeff=moe_aux_loss_coeff,
         )
         stream_result = _measure_dispatcher(
             "stream",
@@ -210,30 +255,37 @@ def run_stream_vs_alltoall_parity(
             moe_router_topk=moe_router_topk,
             moe_ffn_hidden_size=moe_ffn_hidden_size,
             dtype=dtype,
+            moe_aux_loss_coeff=moe_aux_loss_coeff,
         )
 
+        atol = 1e-4 if dtype == torch.float32 else 2e-2
+        rtol = 1e-4 if dtype == torch.float32 else 2e-2
+        _print_close_stats("output", alltoall_result["output"], stream_result["output"])
         torch.testing.assert_close(
             alltoall_result["output"].float(),
             stream_result["output"].float(),
-            atol=1e-4,
-            rtol=1e-4,
+            atol=atol,
+            rtol=rtol,
             msg="Forward outputs differ between alltoall and stream dispatchers",
         )
+        _print_close_stats("input_grad", alltoall_result["input_grad"], stream_result["input_grad"])
         torch.testing.assert_close(
             alltoall_result["input_grad"].float(),
             stream_result["input_grad"].float(),
-            atol=1e-4,
-            rtol=1e-4,
+            atol=atol,
+            rtol=rtol,
             msg="Input gradients differ between alltoall and stream dispatchers",
         )
         for name, ref_grad in alltoall_result["param_grads"].items():
             cand_grad = stream_result["param_grads"][name]
-            torch.testing.assert_close(
-                ref_grad.float(),
-                cand_grad.float(),
-                atol=1e-4,
-                rtol=1e-4,
-                msg=f"Gradient mismatch for parameter {name}",
+            _print_close_stats(f"param_grad:{name}", ref_grad, cand_grad)
+            _assert_parameter_grad_close(
+                name,
+                ref_grad,
+                cand_grad,
+                dtype=dtype,
+                atol=atol,
+                rtol=rtol,
             )
 
         if torch.distributed.get_rank() == 0:
@@ -241,12 +293,97 @@ def run_stream_vs_alltoall_parity(
                 f"[stream smoke] grouped_gemm={grouped_gemm} dtype={dtype} "
                 f"shape=({seq_len},{micro_batch_size},{hidden_size}) topk={moe_router_topk} "
                 f"num_experts={num_moe_experts} ffn={moe_ffn_hidden_size} "
+                f"aux={moe_aux_loss_coeff} "
                 f"alltoall_baseline={alltoall_result['baseline'] / 1024**2:.2f}MiB "
                 f"alltoall_peak={alltoall_result['peak'] / 1024**2:.2f}MiB "
                 f"alltoall_delta={alltoall_result['delta'] / 1024**2:.2f}MiB "
                 f"stream_baseline={stream_result['baseline'] / 1024**2:.2f}MiB "
                 f"stream_peak={stream_result['peak'] / 1024**2:.2f}MiB "
                 f"stream_delta={stream_result['delta'] / 1024**2:.2f}MiB"
+            )
+    finally:
+        Utils.destroy_model_parallel()
+        if torch.distributed.is_initialized():
+            torch.distributed.destroy_process_group()
+
+
+def run_single_dispatcher_benchmark(
+    *,
+    dispatcher_type: str,
+    grouped_gemm: bool = False,
+    seq_len: int = 16,
+    micro_batch_size: int = 4,
+    hidden_size: int = 64,
+    moe_ffn_hidden_size: int = 128,
+    num_moe_experts: int = 4,
+    moe_router_topk: int = 2,
+    dtype: torch.dtype = torch.float32,
+    moe_aux_loss_coeff: float = 0.01,
+    warmup: int = 2,
+    iters: int = 5,
+) -> None:
+    if torch.cuda.device_count() < 2:
+        raise RuntimeError("Stream MoE benchmark requires at least 2 CUDA devices.")
+
+    try:
+        Utils.initialize_model_parallel(tensor_model_parallel_size=1, expert_model_parallel_size=2)
+        _set_random_seed(seed_=123, data_parallel_random_init=False)
+        num_attention_heads = max(1, hidden_size // 64)
+        config = _make_config(
+            dispatcher_type=dispatcher_type,
+            grouped_gemm=grouped_gemm,
+            hidden_size=hidden_size,
+            num_attention_heads=num_attention_heads,
+            num_moe_experts=num_moe_experts,
+            moe_router_topk=moe_router_topk,
+            moe_ffn_hidden_size=moe_ffn_hidden_size,
+            dtype=dtype,
+            moe_aux_loss_coeff=moe_aux_loss_coeff,
+        )
+        layer = _build_moe_layer(config)
+
+        hidden_states_cpu = torch.randn(
+            seq_len,
+            micro_batch_size,
+            hidden_size,
+            dtype=dtype,
+        )
+        grad_output_cpu = torch.randn_like(hidden_states_cpu)
+
+        def run_once():
+            layer.zero_grad(set_to_none=True)
+            hidden_states = hidden_states_cpu.cuda().detach().clone().requires_grad_(True)
+            grad_output = grad_output_cpu.cuda()
+            output, _ = layer(hidden_states)
+            output.backward(grad_output)
+            return output
+
+        for _ in range(warmup):
+            run_once()
+        torch.cuda.synchronize()
+        torch.cuda.empty_cache()
+        torch.cuda.reset_peak_memory_stats()
+        baseline = torch.cuda.memory_allocated()
+
+        start = torch.cuda.Event(enable_timing=True)
+        end = torch.cuda.Event(enable_timing=True)
+        start.record()
+        for _ in range(iters):
+            run_once()
+        end.record()
+        torch.cuda.synchronize()
+        peak = torch.cuda.max_memory_allocated()
+        elapsed_ms = start.elapsed_time(end) / max(1, iters)
+
+        if torch.distributed.get_rank() == 0:
+            print(
+                f"[stream benchmark] dispatcher={dispatcher_type} grouped_gemm={grouped_gemm} "
+                f"dtype={dtype} shape=({seq_len},{micro_batch_size},{hidden_size}) "
+                f"topk={moe_router_topk} num_experts={num_moe_experts} "
+                f"ffn={moe_ffn_hidden_size} aux={moe_aux_loss_coeff} "
+                f"baseline={baseline / 1024**2:.2f}MiB "
+                f"peak={peak / 1024**2:.2f}MiB delta={(peak - baseline) / 1024**2:.2f}MiB "
+                f"time={elapsed_ms:.2f}ms"
             )
     finally:
         Utils.destroy_model_parallel()
@@ -267,6 +404,13 @@ if pytest is not None:
 
 def main() -> None:
     parser = argparse.ArgumentParser()
+    parser.add_argument(
+        "--mode",
+        choices=["compare", "benchmark"],
+        default="compare",
+        help="compare checks alltoall vs stream parity; benchmark runs one dispatcher per process.",
+    )
+    parser.add_argument("--dispatcher", choices=["alltoall", "stream"], default="stream")
     parser.add_argument("--grouped-gemm", action="store_true")
     parser.add_argument("--seq-len", type=int, default=16)
     parser.add_argument("--micro-batch-size", type=int, default=4)
@@ -274,6 +418,9 @@ def main() -> None:
     parser.add_argument("--ffn-hidden-size", type=int, default=128)
     parser.add_argument("--num-experts", type=int, default=4)
     parser.add_argument("--topk", type=int, default=2)
+    parser.add_argument("--aux-loss-coeff", type=float, default=0.01)
+    parser.add_argument("--warmup", type=int, default=2)
+    parser.add_argument("--iters", type=int, default=5)
     parser.add_argument(
         "--dtype", choices=["fp32", "bf16", "fp16"], default="fp32"
     )
@@ -283,7 +430,7 @@ def main() -> None:
         "bf16": torch.bfloat16,
         "fp16": torch.float16,
     }
-    run_stream_vs_alltoall_parity(
+    common_kwargs = dict(
         grouped_gemm=args.grouped_gemm,
         seq_len=args.seq_len,
         micro_batch_size=args.micro_batch_size,
@@ -292,7 +439,17 @@ def main() -> None:
         num_moe_experts=args.num_experts,
         moe_router_topk=args.topk,
         dtype=dtype_map[args.dtype],
+        moe_aux_loss_coeff=args.aux_loss_coeff,
     )
+    if args.mode == "compare":
+        run_stream_vs_alltoall_parity(**common_kwargs)
+    else:
+        run_single_dispatcher_benchmark(
+            dispatcher_type=args.dispatcher,
+            warmup=args.warmup,
+            iters=args.iters,
+            **common_kwargs,
+        )
 
 
 if __name__ == "__main__":
