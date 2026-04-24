@@ -100,7 +100,20 @@ class _StreamRoundWork:
 
 
 @dataclass
+class _PreparedStreamRound:
+    state: dict[str, Any]
+    permuted_tokens: torch.Tensor
+    permuted_probs: torch.Tensor
+
+
+@dataclass
 class _StreamCombineWork:
+    state: dict[str, Any]
+    output_work: _StreamAsyncAllToAll
+
+
+@dataclass
+class _StreamCombineBackwardWork:
     state: dict[str, Any]
     output_work: _StreamAsyncAllToAll
 
@@ -1185,6 +1198,19 @@ class MoEStreamAlltoAllTokenDispatcherV1(MoEAlltoAllTokenDispatcher):
     ) -> _StreamRoundWork:
         """Preprocess and asynchronously dispatch one StreamMoE round."""
 
+        prepared = self.prepare_stream_round_dispatch(
+            hidden_states, round_expert_indices, round_probs
+        )
+        return self.launch_prepared_stream_round_dispatch(prepared)
+
+    def prepare_stream_round_dispatch(
+        self,
+        hidden_states: torch.Tensor,
+        round_expert_indices: torch.LongTensor,
+        round_probs: torch.Tensor,
+    ) -> _PreparedStreamRound:
+        """Prepare one StreamMoE round for later async dispatch launch."""
+
         permuted_tokens, permuted_probs = self.dispatch_preprocess(
             hidden_states, round_expert_indices, round_probs
         )
@@ -1192,17 +1218,33 @@ class MoEStreamAlltoAllTokenDispatcherV1(MoEAlltoAllTokenDispatcher):
             "before_ep_alltoall", self.tokens_per_expert
         )
         state = self._capture_stream_state()
+        return _PreparedStreamRound(
+            state=state,
+            permuted_tokens=permuted_tokens,
+            permuted_probs=permuted_probs,
+        )
+
+    def launch_prepared_stream_round_dispatch(
+        self,
+        prepared: _PreparedStreamRound,
+    ) -> _StreamRoundWork:
+        """Launch async dispatch for a previously prepared StreamMoE round."""
+
         input_work = self._all_to_all_async(
-            permuted_tokens,
-            self.output_splits,
-            self.input_splits,
+            prepared.permuted_tokens,
+            prepared.state["output_splits"],
+            prepared.state["input_splits"],
         )
         probs_work = self._all_to_all_async(
-            permuted_probs,
-            self.output_splits,
-            self.input_splits,
+            prepared.permuted_probs,
+            prepared.state["output_splits"],
+            prepared.state["input_splits"],
         )
-        return _StreamRoundWork(state=state, input_work=input_work, probs_work=probs_work)
+        return _StreamRoundWork(
+            state=prepared.state,
+            input_work=input_work,
+            probs_work=probs_work,
+        )
 
     def finish_stream_round_dispatch(
         self, work: _StreamRoundWork
@@ -1233,6 +1275,33 @@ class MoEStreamAlltoAllTokenDispatcherV1(MoEAlltoAllTokenDispatcher):
         self._restore_stream_state(work.state)
         permuted_local_input_tokens = work.output_work.wait_current_stream()
         return self.combine_postprocess(permuted_local_input_tokens)
+
+    def start_stream_round_combine_backward(
+        self,
+        grad_output: torch.Tensor,
+        state: dict[str, Any],
+    ) -> _StreamCombineBackwardWork:
+        """Asynchronously dispatch one round's output gradient back to expert ranks."""
+
+        hidden_dim = int(state["hidden_shape"][-1])
+        grad_output = grad_output.contiguous().view(-1, hidden_dim)
+        permuted_local_grad = grad_output.index_select(
+            0, state["reversed_local_input_permutation_mapping"]
+        )
+        output_work = self._all_to_all_async(
+            permuted_local_grad,
+            state["output_splits"],
+            state["input_splits"],
+        )
+        return _StreamCombineBackwardWork(state=state, output_work=output_work)
+
+    def finish_stream_round_combine_backward(
+        self,
+        work: _StreamCombineBackwardWork,
+    ) -> torch.Tensor:
+        """Wait for a prefetched combine-backward dispatch to reach expert ranks."""
+
+        return work.output_work.wait_current_stream()
 
 
 class _DispatchManager(ABC):
