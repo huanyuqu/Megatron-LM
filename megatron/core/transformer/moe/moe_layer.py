@@ -166,19 +166,43 @@ class _StreamMoEOverlapCheckpoint(torch.autograd.Function):
         with torch.enable_grad():
             topk_probs, topk_indices = module.route_compact(hidden_states, padding_mask)
             round_plan = build_stream_round_plan(topk_probs, topk_indices)
+            token_dispatcher = module.token_dispatcher
+            pending_dispatch = None
 
             for round_index in range(round_plan.num_rounds - 1, -1, -1):
                 round_assignment = round_plan.rounds[round_index]
-                round_output = module._stream_round_forward(
-                    hidden_states,
-                    round_assignment.probs,
-                    round_assignment.expert_indices,
-                )
+                next_dispatch = None
+                if (
+                    isinstance(token_dispatcher, MoEStreamAlltoAllTokenDispatcherV1)
+                    and round_index > 0
+                ):
+                    next_assignment = round_plan.rounds[round_index - 1]
+                    next_dispatch = token_dispatcher.start_stream_round_dispatch(
+                        hidden_states,
+                        next_assignment.expert_indices,
+                        next_assignment.probs,
+                    )
+
+                if pending_dispatch is None:
+                    round_output = module._stream_round_forward(
+                        hidden_states,
+                        round_assignment.probs,
+                        round_assignment.expert_indices,
+                    )
+                else:
+                    dispatched_input, dispatched_probs = token_dispatcher.finish_stream_round_dispatch(
+                        pending_dispatch
+                    )
+                    round_output = module._stream_round_forward_from_dispatched(
+                        dispatched_input,
+                        dispatched_probs,
+                    )
                 torch.autograd.backward(
                     round_output,
                     grad_output,
                     retain_graph=round_index > 0,
                 )
+                pending_dispatch = next_dispatch
 
         return None, hidden_states.grad, None
 
@@ -645,6 +669,18 @@ class MoELayer(BaseMoELayer):
             hidden_states, round_expert_indices, round_probs
         )
         dispatched_input, dispatched_probs = self.dispatch(hidden_states, round_probs)
+        output, mlp_bias = self.routed_experts_compute(dispatched_input, dispatched_probs)
+        assert mlp_bias is None, f"mlp_bias is not supported for {type(self.token_dispatcher)}"
+        output = self.combine(output)
+        return self.token_dispatcher.combine_postprocess(output)
+
+    def _stream_round_forward_from_dispatched(
+        self,
+        dispatched_input: torch.Tensor,
+        dispatched_probs: torch.Tensor,
+    ) -> torch.Tensor:
+        """Finish one StreamMoE round from pre-dispatched inputs."""
+
         output, mlp_bias = self.routed_experts_compute(dispatched_input, dispatched_probs)
         assert mlp_bias is None, f"mlp_bias is not supported for {type(self.token_dispatcher)}"
         output = self.combine(output)

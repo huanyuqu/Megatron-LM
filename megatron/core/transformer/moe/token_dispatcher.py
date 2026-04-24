@@ -51,6 +51,34 @@ from megatron.core.transformer.transformer_config import TransformerConfig
 logger = logging.getLogger(__name__)
 
 
+class _StreamAsyncAllToAllAlias(torch.autograd.Function):
+    """Attach an autograd edge to an async all-to-all output tensor."""
+
+    @staticmethod
+    def forward(
+        ctx,
+        original_input: torch.Tensor,
+        async_output: torch.Tensor,
+        output_split_sizes: Optional[tuple[int, ...]],
+        input_split_sizes: Optional[tuple[int, ...]],
+        group,
+    ) -> torch.Tensor:
+        ctx.group = group
+        ctx.output_split_sizes = output_split_sizes
+        ctx.input_split_sizes = input_split_sizes
+        return async_output
+
+    @staticmethod
+    def backward(ctx, grad_output: torch.Tensor):
+        grad_input = all_to_all(
+            ctx.group,
+            grad_output.contiguous(),
+            ctx.input_split_sizes,
+            ctx.output_split_sizes,
+        )
+        return grad_input, None, None, None, None
+
+
 @dataclass
 class _StreamAsyncAllToAll:
     output: torch.Tensor
@@ -999,6 +1027,12 @@ class MoEStreamAlltoAllTokenDispatcherV1(MoEAlltoAllTokenDispatcher):
         for name, value in state.items():
             setattr(self, name, value)
 
+    @staticmethod
+    def _normalize_split_sizes(split_sizes: Optional[Any]) -> Optional[tuple[int, ...]]:
+        if split_sizes is None:
+            return None
+        return tuple(int(size) for size in split_sizes)
+
     def _all_to_all_async(
         self,
         input_: torch.Tensor,
@@ -1006,6 +1040,9 @@ class MoEStreamAlltoAllTokenDispatcherV1(MoEAlltoAllTokenDispatcher):
         input_split_sizes: Optional[Any],
     ) -> _StreamAsyncAllToAll:
         """Launch an async EP all-to-all on the StreamMoE communication stream."""
+
+        output_split_sizes = self._normalize_split_sizes(output_split_sizes)
+        input_split_sizes = self._normalize_split_sizes(input_split_sizes)
 
         if self.ep_group.size() == 1:
             event = torch.cuda.current_stream().record_event()
@@ -1035,6 +1072,15 @@ class MoEStreamAlltoAllTokenDispatcherV1(MoEAlltoAllTokenDispatcher):
             event = self.stream_comm_stream.record_event()
         input_.record_stream(self.stream_comm_stream)
         output.record_stream(self.stream_comm_stream)
+        if input_.requires_grad:
+            output = _StreamAsyncAllToAllAlias.apply(
+                input_,
+                output,
+                output_split_sizes,
+                input_split_sizes,
+                self.ep_group,
+            )
+            output.record_stream(self.stream_comm_stream)
         return _StreamAsyncAllToAll(output=output, event=event, work=work)
 
     def _preprocess_compact(
