@@ -751,6 +751,9 @@ class TransformerConfig(ModelParallelConfig):
     """The type of token dispatcher to use. The default is 'allgather'.
     Options are 'allgather','alltoall', 'flex', and 'stream'."""
 
+    moe_stream_overlap: bool = False
+    """Enable experimental StreamMoE v1 round dispatch/combine overlap."""
+
     moe_enable_deepep: bool = False
     """[Experimental] Enable DeepEP for efficient token dispatching and combine in MoE models."""
 

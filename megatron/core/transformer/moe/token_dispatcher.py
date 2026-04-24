@@ -2,7 +2,8 @@
 
 import logging
 from abc import ABC, abstractmethod
-from typing import List, Optional, Tuple
+from dataclasses import dataclass
+from typing import Any, List, Optional, Tuple
 
 import torch
 
@@ -48,6 +49,32 @@ from megatron.core.transformer.transformer_config import TransformerConfig
 """
 
 logger = logging.getLogger(__name__)
+
+
+@dataclass
+class _StreamAsyncAllToAll:
+    output: torch.Tensor
+    event: torch.cuda.Event
+    work: Optional[Any]
+
+    def wait_current_stream(self) -> torch.Tensor:
+        if self.work is not None:
+            self.work.wait()
+        torch.cuda.current_stream().wait_event(self.event)
+        return self.output
+
+
+@dataclass
+class _StreamRoundWork:
+    state: dict[str, Any]
+    input_work: _StreamAsyncAllToAll
+    probs_work: _StreamAsyncAllToAll
+
+
+@dataclass
+class _StreamCombineWork:
+    state: dict[str, Any]
+    output_work: _StreamAsyncAllToAll
 
 
 class MoETokenDispatcher:
@@ -939,6 +966,77 @@ class MoEStreamAlltoAllTokenDispatcherV1(MoEAlltoAllTokenDispatcher):
     compact expert assignment per token for the current round.
     """
 
+    _stream_state_attrs = (
+        "hidden_shape",
+        "probs",
+        "routing_map",
+        "tokens_per_expert",
+        "input_splits",
+        "output_splits",
+        "output_splits_tp",
+        "num_global_tokens_per_local_expert",
+        "num_out_tokens",
+        "hidden_shape_before_permute",
+        "reversed_local_input_permutation_mapping",
+        "d2h_event",
+        "cuda_sync_point",
+    )
+
+    def __init__(
+        self,
+        num_local_experts: int,
+        local_expert_indices: List[int],
+        config: TransformerConfig,
+        pg_collection: Optional[ProcessGroupCollection] = None,
+    ) -> None:
+        super().__init__(num_local_experts, local_expert_indices, config, pg_collection)
+        self.stream_comm_stream = torch.cuda.Stream()
+
+    def _capture_stream_state(self) -> dict[str, Any]:
+        return {name: getattr(self, name, None) for name in self._stream_state_attrs}
+
+    def _restore_stream_state(self, state: dict[str, Any]) -> None:
+        for name, value in state.items():
+            setattr(self, name, value)
+
+    def _all_to_all_async(
+        self,
+        input_: torch.Tensor,
+        output_split_sizes: Optional[Any],
+        input_split_sizes: Optional[Any],
+    ) -> _StreamAsyncAllToAll:
+        """Launch an async EP all-to-all on the StreamMoE communication stream."""
+
+        if self.ep_group.size() == 1:
+            event = torch.cuda.current_stream().record_event()
+            return _StreamAsyncAllToAll(output=input_, event=event, work=None)
+
+        input_ = input_.contiguous()
+        if output_split_sizes is None:
+            output = torch.empty_like(input_)
+        else:
+            output = input_.new_empty(
+                size=[sum(output_split_sizes)] + list(input_.size()[1:]),
+                dtype=input_.dtype,
+                device=torch.cuda.current_device(),
+            )
+
+        current_stream = torch.cuda.current_stream()
+        self.stream_comm_stream.wait_stream(current_stream)
+        with torch.cuda.stream(self.stream_comm_stream):
+            work = torch.distributed.all_to_all_single(
+                output,
+                input_,
+                output_split_sizes=output_split_sizes,
+                input_split_sizes=input_split_sizes,
+                group=self.ep_group,
+                async_op=True,
+            )
+            event = self.stream_comm_stream.record_event()
+        input_.record_stream(self.stream_comm_stream)
+        output.record_stream(self.stream_comm_stream)
+        return _StreamAsyncAllToAll(output=output, event=event, work=work)
+
     def _preprocess_compact(
         self, expert_indices: torch.LongTensor, probs: torch.Tensor
     ) -> torch.Tensor:
@@ -1032,6 +1130,63 @@ class MoEStreamAlltoAllTokenDispatcherV1(MoEAlltoAllTokenDispatcher):
         )
         permuted_probs = probs.index_select(0, self.reversed_local_input_permutation_mapping)
         return permutated_local_input_tokens, permuted_probs
+
+    def start_stream_round_dispatch(
+        self,
+        hidden_states: torch.Tensor,
+        round_expert_indices: torch.LongTensor,
+        round_probs: torch.Tensor,
+    ) -> _StreamRoundWork:
+        """Preprocess and asynchronously dispatch one StreamMoE round."""
+
+        permuted_tokens, permuted_probs = self.dispatch_preprocess(
+            hidden_states, round_expert_indices, round_probs
+        )
+        self.tokens_per_expert = self._maybe_dtoh_and_synchronize(
+            "before_ep_alltoall", self.tokens_per_expert
+        )
+        state = self._capture_stream_state()
+        input_work = self._all_to_all_async(
+            permuted_tokens,
+            self.output_splits,
+            self.input_splits,
+        )
+        probs_work = self._all_to_all_async(
+            permuted_probs,
+            self.output_splits,
+            self.input_splits,
+        )
+        return _StreamRoundWork(state=state, input_work=input_work, probs_work=probs_work)
+
+    def finish_stream_round_dispatch(
+        self, work: _StreamRoundWork
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Wait for a previously launched StreamMoE round dispatch."""
+
+        self._restore_stream_state(work.state)
+        global_input_tokens = work.input_work.wait_current_stream()
+        global_probs = work.probs_work.wait_current_stream()
+        return global_input_tokens, global_probs
+
+    def start_stream_round_combine(
+        self, hidden_states: torch.Tensor
+    ) -> _StreamCombineWork:
+        """Asynchronously combine one StreamMoE round back to home ranks."""
+
+        state = self._capture_stream_state()
+        output_work = self._all_to_all_async(
+            hidden_states,
+            self.input_splits,
+            self.output_splits,
+        )
+        return _StreamCombineWork(state=state, output_work=output_work)
+
+    def finish_stream_round_combine(self, work: _StreamCombineWork) -> torch.Tensor:
+        """Wait for a StreamMoE combine and restore token order."""
+
+        self._restore_stream_state(work.state)
+        permuted_local_input_tokens = work.output_work.wait_current_stream()
+        return self.combine_postprocess(permuted_local_input_tokens)
 
 
 class _DispatchManager(ABC):

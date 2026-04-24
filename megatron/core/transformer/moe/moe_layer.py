@@ -140,6 +140,49 @@ class RouterBuilder(Protocol):
     ) -> RouterInterface: ...
 
 
+class _StreamMoEOverlapCheckpoint(torch.autograd.Function):
+    """Checkpoint StreamMoE while using an overlapped no-grad forward."""
+
+    @staticmethod
+    def forward(ctx, module, hidden_states, padding_mask):
+        ctx.module = module
+        ctx.has_padding_mask = padding_mask is not None
+        if ctx.has_padding_mask:
+            ctx.save_for_backward(hidden_states, padding_mask)
+        else:
+            ctx.save_for_backward(hidden_states)
+
+        with torch.no_grad():
+            return module._stream_forward_overlap(hidden_states, padding_mask)
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        module = ctx.module
+        saved_tensors = ctx.saved_tensors
+        hidden_states = saved_tensors[0].detach()
+        hidden_states.requires_grad_(saved_tensors[0].requires_grad)
+        padding_mask = saved_tensors[1] if ctx.has_padding_mask else None
+
+        with torch.enable_grad():
+            topk_probs, topk_indices = module.route_compact(hidden_states, padding_mask)
+            round_plan = build_stream_round_plan(topk_probs, topk_indices)
+
+            for round_index in range(round_plan.num_rounds - 1, -1, -1):
+                round_assignment = round_plan.rounds[round_index]
+                round_output = module._stream_round_forward(
+                    hidden_states,
+                    round_assignment.probs,
+                    round_assignment.expert_indices,
+                )
+                torch.autograd.backward(
+                    round_output,
+                    grad_output,
+                    retain_graph=round_index > 0,
+                )
+
+        return None, hidden_states.grad, None
+
+
 @dataclass
 class MoESubmodules:
     """MoE Layer Submodule spec"""
@@ -637,6 +680,67 @@ class MoELayer(BaseMoELayer):
             round_expert_indices,
         )
 
+    def _stream_forward_overlap(
+        self,
+        hidden_states: torch.Tensor,
+        padding_mask: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        """Run StreamMoE with round dispatch/combine overlapped with expert compute."""
+
+        token_dispatcher = self.token_dispatcher
+        assert isinstance(token_dispatcher, MoEStreamAlltoAllTokenDispatcherV1)
+
+        topk_probs, topk_indices = self.route_compact(hidden_states, padding_mask)
+        round_plan = build_stream_round_plan(topk_probs, topk_indices)
+        if round_plan.num_rounds == 0:
+            return torch.zeros_like(hidden_states)
+
+        pending_dispatch = token_dispatcher.start_stream_round_dispatch(
+            hidden_states,
+            round_plan.rounds[0].expert_indices,
+            round_plan.rounds[0].probs,
+        )
+        pending_combine = None
+        accumulated_output = None
+
+        for round_index, round_assignment in enumerate(round_plan.rounds):
+            current_dispatch = pending_dispatch
+            next_dispatch = None
+            if round_index + 1 < round_plan.num_rounds:
+                next_assignment = round_plan.rounds[round_index + 1]
+                next_dispatch = token_dispatcher.start_stream_round_dispatch(
+                    hidden_states,
+                    next_assignment.expert_indices,
+                    next_assignment.probs,
+                )
+
+            dispatched_input, dispatched_probs = token_dispatcher.finish_stream_round_dispatch(
+                current_dispatch
+            )
+            output, mlp_bias = self.routed_experts_compute(dispatched_input, dispatched_probs)
+            assert mlp_bias is None, f"mlp_bias is not supported for {type(token_dispatcher)}"
+
+            # Finishing the previous combine restores the previous round's dispatcher state, so
+            # save and restore the current state before launching this round's combine.
+            current_state = token_dispatcher._capture_stream_state()
+            if pending_combine is not None:
+                round_output = token_dispatcher.finish_stream_round_combine(pending_combine)
+                accumulated_output = (
+                    round_output
+                    if accumulated_output is None
+                    else accumulated_output + round_output
+                )
+            token_dispatcher._restore_stream_state(current_state)
+            pending_combine = token_dispatcher.start_stream_round_combine(output)
+            pending_dispatch = next_dispatch
+
+        assert pending_combine is not None
+        round_output = token_dispatcher.finish_stream_round_combine(pending_combine)
+        accumulated_output = (
+            round_output if accumulated_output is None else accumulated_output + round_output
+        )
+        return accumulated_output
+
     def router_and_preprocess(self, hidden_states: torch.Tensor):
         """This method is a combined method of route and preprocess. Deprecated."""
 
@@ -682,6 +786,10 @@ class MoELayer(BaseMoELayer):
                 raise ValueError("StreamMoE v1 only supports training mode.")
             if intermediate_tensors is not None:
                 raise ValueError("StreamMoE v1 does not support intermediate_tensors.")
+
+            if self.config.moe_stream_overlap:
+                output = _StreamMoEOverlapCheckpoint.apply(self, hidden_states, padding_mask)
+                return output, None
 
             topk_probs, topk_indices = self.route_compact(hidden_states, padding_mask)
             round_plan = build_stream_round_plan(topk_probs, topk_indices)
