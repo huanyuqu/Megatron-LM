@@ -18,6 +18,7 @@ def _make_config(
     dispatcher_type: str,
     grouped_gemm: bool,
     stream_overlap: bool,
+    stream_version: str,
     hidden_size: int,
     num_attention_heads: int,
     num_moe_experts: int,
@@ -33,6 +34,7 @@ def _make_config(
         num_moe_experts=num_moe_experts,
         use_cpu_initialization=False,
         moe_token_dispatcher_type=dispatcher_type,
+        moe_stream_version=stream_version,
         moe_stream_overlap=stream_overlap,
         moe_router_load_balancing_type="aux_loss",
         moe_router_topk=moe_router_topk,
@@ -137,6 +139,7 @@ def _measure_dispatcher(
     *,
     grouped_gemm: bool,
     stream_overlap: bool,
+    stream_version: str,
     hidden_size: int,
     num_attention_heads: int,
     num_moe_experts: int,
@@ -148,6 +151,7 @@ def _measure_dispatcher(
     config = _make_config(
         dispatcher_type=dispatcher_type,
         grouped_gemm=grouped_gemm,
+        stream_version=stream_version,
         stream_overlap=stream_overlap,
         hidden_size=hidden_size,
         num_attention_heads=num_attention_heads,
@@ -193,6 +197,7 @@ def run_stream_vs_alltoall_parity(
     *,
     grouped_gemm: bool = False,
     stream_overlap: bool = False,
+    stream_version: str = "v1",
     seq_len: int = 16,
     micro_batch_size: int = 4,
     hidden_size: int = 64,
@@ -213,6 +218,7 @@ def run_stream_vs_alltoall_parity(
         reference_config = _make_config(
             dispatcher_type="alltoall",
             grouped_gemm=grouped_gemm,
+            stream_version="v1",
             stream_overlap=False,
             hidden_size=hidden_size,
             num_attention_heads=num_attention_heads,
@@ -241,6 +247,7 @@ def run_stream_vs_alltoall_parity(
             hidden_states_cpu,
             grad_output_cpu,
             grouped_gemm=grouped_gemm,
+            stream_version="v1",
             stream_overlap=False,
             hidden_size=hidden_size,
             num_attention_heads=num_attention_heads,
@@ -256,6 +263,7 @@ def run_stream_vs_alltoall_parity(
             hidden_states_cpu,
             grad_output_cpu,
             grouped_gemm=grouped_gemm,
+            stream_version=stream_version,
             stream_overlap=stream_overlap,
             hidden_size=hidden_size,
             num_attention_heads=num_attention_heads,
@@ -299,6 +307,7 @@ def run_stream_vs_alltoall_parity(
         if torch.distributed.get_rank() == 0:
             print(
                 f"[stream smoke] grouped_gemm={grouped_gemm} dtype={dtype} "
+                f"stream_version={stream_version} "
                 f"stream_overlap={stream_overlap} "
                 f"shape=({seq_len},{micro_batch_size},{hidden_size}) topk={moe_router_topk} "
                 f"num_experts={num_moe_experts} ffn={moe_ffn_hidden_size} "
@@ -321,6 +330,7 @@ def run_single_dispatcher_benchmark(
     dispatcher_type: str,
     grouped_gemm: bool = False,
     stream_overlap: bool = False,
+    stream_version: str = "v1",
     seq_len: int = 16,
     micro_batch_size: int = 4,
     hidden_size: int = 64,
@@ -342,6 +352,7 @@ def run_single_dispatcher_benchmark(
         config = _make_config(
             dispatcher_type=dispatcher_type,
             grouped_gemm=grouped_gemm,
+            stream_version=stream_version if dispatcher_type == "stream" else "v1",
             stream_overlap=stream_overlap and dispatcher_type == "stream",
             hidden_size=hidden_size,
             num_attention_heads=num_attention_heads,
@@ -389,6 +400,7 @@ def run_single_dispatcher_benchmark(
         if torch.distributed.get_rank() == 0:
             print(
                 f"[stream benchmark] dispatcher={dispatcher_type} grouped_gemm={grouped_gemm} "
+                f"stream_version={stream_version if dispatcher_type == 'stream' else 'v1'} "
                 f"stream_overlap={stream_overlap and dispatcher_type == 'stream'} "
                 f"dtype={dtype} shape=({seq_len},{micro_batch_size},{hidden_size}) "
                 f"topk={moe_router_topk} num_experts={num_moe_experts} "
@@ -424,6 +436,7 @@ def main() -> None:
     )
     parser.add_argument("--dispatcher", choices=["alltoall", "stream"], default="stream")
     parser.add_argument("--grouped-gemm", action="store_true")
+    parser.add_argument("--stream-version", choices=["v1", "v2"], default="v1")
     parser.add_argument("--stream-overlap", action="store_true")
     parser.add_argument("--seq-len", type=int, default=16)
     parser.add_argument("--micro-batch-size", type=int, default=4)
@@ -445,6 +458,7 @@ def main() -> None:
     }
     common_kwargs = dict(
         grouped_gemm=args.grouped_gemm,
+        stream_version=args.stream_version,
         stream_overlap=args.stream_overlap,
         seq_len=args.seq_len,
         micro_batch_size=args.micro_batch_size,

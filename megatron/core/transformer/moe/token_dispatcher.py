@@ -118,6 +118,47 @@ class _StreamCombineBackwardWork:
     output_work: _StreamAsyncAllToAll
 
 
+@dataclass
+class _StreamV2RoundStateWork:
+    state: dict[str, Any]
+    x_work: _StreamAsyncAllToAll
+    acc_work: _StreamAsyncAllToAll
+    global_token_ids_work: _StreamAsyncAllToAll
+    remaining_probs_work: _StreamAsyncAllToAll
+    remaining_slot_ids_work: _StreamAsyncAllToAll
+
+
+@dataclass
+class _StreamV2RoundPrefetchWork:
+    state: dict[str, Any]
+    x_work: _StreamAsyncAllToAll
+    global_token_ids_work: _StreamAsyncAllToAll
+    remaining_probs_work: _StreamAsyncAllToAll
+    remaining_slot_ids_work: _StreamAsyncAllToAll
+
+
+@dataclass
+class _StreamV2SplitRoundStateWork:
+    prefetch_work: _StreamV2RoundPrefetchWork
+    acc_work: _StreamAsyncAllToAll
+
+
+@dataclass
+class _StreamV2TokenState:
+    x: torch.Tensor
+    current_probs: torch.Tensor
+    acc: torch.Tensor
+    global_token_ids: torch.Tensor
+    remaining_probs: torch.Tensor
+    remaining_slot_ids: torch.Tensor
+
+
+@dataclass
+class _StreamV2HomeCombineWork:
+    acc_work: _StreamAsyncAllToAll
+    global_token_ids_work: _StreamAsyncAllToAll
+
+
 class MoETokenDispatcher:
     """
     MoE Token Dispatcher
@@ -1040,11 +1081,52 @@ class MoEStreamAlltoAllTokenDispatcherV1(MoEAlltoAllTokenDispatcher):
         for name, value in state.items():
             setattr(self, name, value)
 
+    def _build_stream_dispatch_state(
+        self,
+        expert_indices: torch.LongTensor,
+    ) -> dict[str, Any]:
+        """Build compact dispatch metadata without materializing token/prob payloads."""
+
+        saved_state = self._capture_stream_state()
+        expert_indices = expert_indices.reshape(-1).to(torch.long)
+        try:
+            self.hidden_shape = torch.Size((expert_indices.numel(),))
+            self.probs = None
+            self.routing_map = None
+            self.tokens_per_expert = self._preprocess_compact(expert_indices, None)
+            self.tokens_per_expert = self._maybe_dtoh_and_synchronize(
+                "before_permutation_1", self.tokens_per_expert
+            )
+            self.hidden_shape_before_permute = torch.Size((expert_indices.numel(),))
+            self.reversed_local_input_permutation_mapping = torch.argsort(
+                expert_indices, descending=False, stable=True
+            )
+            self.tokens_per_expert = self._maybe_dtoh_and_synchronize(
+                "before_ep_alltoall", self.tokens_per_expert
+            )
+            return self._capture_stream_state()
+        finally:
+            self._restore_stream_state(saved_state)
+
     @staticmethod
     def _normalize_split_sizes(split_sizes: Optional[Any]) -> Optional[tuple[int, ...]]:
         if split_sizes is None:
             return None
         return tuple(int(size) for size in split_sizes)
+
+    def _launch_stream_payload_dispatch(
+        self,
+        payload: torch.Tensor,
+        state: dict[str, Any],
+    ) -> _StreamAsyncAllToAll:
+        """Dispatch an arbitrary per-token payload with a previously prepared StreamMoE state."""
+
+        permuted_payload = payload.index_select(0, state["reversed_local_input_permutation_mapping"])
+        return self._all_to_all_async(
+            permuted_payload,
+            state["output_splits"],
+            state["input_splits"],
+        )
 
     def _all_to_all_async(
         self,
@@ -1302,6 +1384,177 @@ class MoEStreamAlltoAllTokenDispatcherV1(MoEAlltoAllTokenDispatcher):
         """Wait for a prefetched combine-backward dispatch to reach expert ranks."""
 
         return work.output_work.wait_current_stream()
+
+
+class MoEStreamAlltoAllTokenDispatcherV2(MoEStreamAlltoAllTokenDispatcherV1):
+    """Direct-flow StreamMoE dispatcher that keeps token state on expert ranks across rounds."""
+
+    def prepare_stream_v2_round_dispatch(
+        self,
+        round_expert_indices: torch.LongTensor,
+    ) -> dict[str, Any]:
+        """Build dispatch metadata for one V2 direct-flow hop."""
+
+        return self._build_stream_dispatch_state(round_expert_indices)
+
+    def start_stream_v2_round_dispatch(
+        self,
+        state: dict[str, Any],
+        x: torch.Tensor,
+        acc: torch.Tensor,
+        global_token_ids: torch.Tensor,
+        remaining_probs: torch.Tensor,
+        remaining_slot_ids: torch.Tensor,
+    ) -> _StreamV2RoundStateWork:
+        """Dispatch the compact V2 token state for one direct-flow round."""
+
+        x_work = self._launch_stream_payload_dispatch(x, state)
+        acc_work = self._launch_stream_payload_dispatch(acc, state)
+        global_token_ids_work = self._launch_stream_payload_dispatch(global_token_ids, state)
+        remaining_probs_work = self._launch_stream_payload_dispatch(remaining_probs, state)
+        remaining_slot_ids_work = self._launch_stream_payload_dispatch(remaining_slot_ids, state)
+        return _StreamV2RoundStateWork(
+            state=state,
+            x_work=x_work,
+            acc_work=acc_work,
+            global_token_ids_work=global_token_ids_work,
+            remaining_probs_work=remaining_probs_work,
+            remaining_slot_ids_work=remaining_slot_ids_work,
+        )
+
+    def start_stream_v2_round_prefetch(
+        self,
+        state: dict[str, Any],
+        x: torch.Tensor,
+        global_token_ids: torch.Tensor,
+        remaining_probs: torch.Tensor,
+        remaining_slot_ids: torch.Tensor,
+    ) -> _StreamV2RoundPrefetchWork:
+        """Pre-dispatch the next V2 round's x/metadata before acc is ready."""
+
+        return _StreamV2RoundPrefetchWork(
+            state=state,
+            x_work=self._launch_stream_payload_dispatch(x, state),
+            global_token_ids_work=self._launch_stream_payload_dispatch(global_token_ids, state),
+            remaining_probs_work=self._launch_stream_payload_dispatch(remaining_probs, state),
+            remaining_slot_ids_work=self._launch_stream_payload_dispatch(
+                remaining_slot_ids, state
+            ),
+        )
+
+    def start_stream_v2_round_acc_dispatch(
+        self,
+        state: dict[str, Any],
+        acc: torch.Tensor,
+    ) -> _StreamAsyncAllToAll:
+        """Dispatch only the accumulator payload for the next V2 round."""
+
+        return self._launch_stream_payload_dispatch(acc, state)
+
+    def build_stream_v2_split_round_dispatch(
+        self,
+        prefetch_work: _StreamV2RoundPrefetchWork,
+        acc_work: _StreamAsyncAllToAll,
+    ) -> _StreamV2SplitRoundStateWork:
+        """Bundle a two-phase V2 dispatch into one handle for the next round."""
+
+        return _StreamV2SplitRoundStateWork(
+            prefetch_work=prefetch_work,
+            acc_work=acc_work,
+        )
+
+    def finish_stream_v2_round_dispatch(
+        self,
+        work: _StreamV2RoundStateWork,
+    ) -> _StreamV2TokenState:
+        """Wait for one V2 token-state dispatch to arrive on the current expert rank."""
+
+        self._restore_stream_state(work.state)
+        x = work.x_work.wait_current_stream()
+        acc = work.acc_work.wait_current_stream()
+        global_token_ids = work.global_token_ids_work.wait_current_stream()
+        received_remaining_probs = work.remaining_probs_work.wait_current_stream()
+        received_remaining_slot_ids = work.remaining_slot_ids_work.wait_current_stream()
+        return _StreamV2TokenState(
+            x=x,
+            current_probs=received_remaining_probs[:, 0],
+            acc=acc,
+            global_token_ids=global_token_ids,
+            remaining_probs=received_remaining_probs[:, 1:],
+            remaining_slot_ids=received_remaining_slot_ids[:, 1:],
+        )
+
+    def finish_stream_v2_split_round_dispatch(
+        self,
+        work: _StreamV2SplitRoundStateWork,
+    ) -> _StreamV2TokenState:
+        """Finish a V2 round whose x/metadata and acc were dispatched in two phases."""
+
+        self._restore_stream_state(work.prefetch_work.state)
+        x = work.prefetch_work.x_work.wait_current_stream()
+        global_token_ids = work.prefetch_work.global_token_ids_work.wait_current_stream()
+        received_remaining_probs = work.prefetch_work.remaining_probs_work.wait_current_stream()
+        received_remaining_slot_ids = work.prefetch_work.remaining_slot_ids_work.wait_current_stream()
+        acc = work.acc_work.wait_current_stream()
+        return _StreamV2TokenState(
+            x=x,
+            current_probs=received_remaining_probs[:, 0],
+            acc=acc,
+            global_token_ids=global_token_ids,
+            remaining_probs=received_remaining_probs[:, 1:],
+            remaining_slot_ids=received_remaining_slot_ids[:, 1:],
+        )
+
+    def finish_stream_v2_state_dispatch(
+        self,
+        work: _StreamV2RoundStateWork | _StreamV2SplitRoundStateWork,
+    ) -> _StreamV2TokenState:
+        """Finish either a normal or overlapped V2 round-state dispatch."""
+
+        if isinstance(work, _StreamV2SplitRoundStateWork):
+            return self.finish_stream_v2_split_round_dispatch(work)
+        return self.finish_stream_v2_round_dispatch(work)
+
+    def prepare_stream_home_dispatch(
+        self,
+        global_token_ids: torch.Tensor,
+        num_tokens_per_home_rank: int,
+    ) -> dict[str, Any]:
+        """Build return-to-home dispatch metadata for V2's final accumulation."""
+
+        home_ep_ranks = torch.div(
+            global_token_ids.reshape(-1).to(torch.long),
+            num_tokens_per_home_rank,
+            rounding_mode="floor",
+        )
+        # Map each target EP rank to the first expert hosted on that rank. For direct-flow state
+        # movement we only care about the destination rank, not the expert identity.
+        pseudo_expert_indices = home_ep_ranks * self.num_local_experts
+        return self._build_stream_dispatch_state(pseudo_expert_indices)
+
+    def start_stream_v2_home_combine(
+        self,
+        acc: torch.Tensor,
+        global_token_ids: torch.Tensor,
+        num_tokens_per_home_rank: int,
+    ) -> _StreamV2HomeCombineWork:
+        """Dispatch the accumulated outputs back to the home ranks."""
+
+        state = self.prepare_stream_home_dispatch(global_token_ids, num_tokens_per_home_rank)
+        return _StreamV2HomeCombineWork(
+            acc_work=self._launch_stream_payload_dispatch(acc, state),
+            global_token_ids_work=self._launch_stream_payload_dispatch(global_token_ids, state),
+        )
+
+    def finish_stream_v2_home_combine(
+        self,
+        work: _StreamV2HomeCombineWork,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Wait for the final V2 return-to-home dispatch."""
+
+        acc = work.acc_work.wait_current_stream()
+        global_token_ids = work.global_token_ids_work.wait_current_stream()
+        return acc, global_token_ids
 
 
 class _DispatchManager(ABC):
