@@ -757,6 +757,9 @@ class TransformerConfig(ModelParallelConfig):
     moe_stream_overlap: bool = False
     """Enable experimental StreamMoE v1 round dispatch/combine overlap."""
 
+    moe_stream_v2_sparse_comm: bool = False
+    """Enable experimental sparse peer-to-peer communication for StreamMoE v2 token-state hops."""
+
     moe_enable_deepep: bool = False
     """[Experimental] Enable DeepEP for efficient token dispatching and combine in MoE models."""
 
@@ -1453,6 +1456,8 @@ class TransformerConfig(ModelParallelConfig):
 
         if self.moe_token_dispatcher_type == "stream":
             stream_version = self.moe_stream_version
+            if self.moe_stream_v2_sparse_comm and stream_version != "v2":
+                raise ValueError("moe_stream_v2_sparse_comm is only supported with StreamMoE v2.")
             if self.moe_shared_expert_intermediate_size is not None:
                 raise ValueError(f"StreamMoE {stream_version} does not support shared experts.")
             if self.moe_latent_size is not None:

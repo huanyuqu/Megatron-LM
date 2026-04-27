@@ -79,6 +79,34 @@ class _StreamAsyncAllToAllAlias(torch.autograd.Function):
         return grad_input, None, None, None, None
 
 
+class _StreamAsyncSparseExchangeAlias(torch.autograd.Function):
+    """Attach an autograd edge to an async sparse peer exchange output tensor."""
+
+    @staticmethod
+    def forward(
+        ctx,
+        original_input: torch.Tensor,
+        async_output: torch.Tensor,
+        output_split_sizes: Optional[tuple[int, ...]],
+        input_split_sizes: Optional[tuple[int, ...]],
+        group,
+    ) -> torch.Tensor:
+        ctx.group = group
+        ctx.output_split_sizes = output_split_sizes
+        ctx.input_split_sizes = input_split_sizes
+        return async_output
+
+    @staticmethod
+    def backward(ctx, grad_output: torch.Tensor):
+        grad_input = MoEStreamAlltoAllTokenDispatcherV1._sparse_all_to_all_sync(
+            ctx.group,
+            grad_output.contiguous(),
+            ctx.input_split_sizes,
+            ctx.output_split_sizes,
+        )
+        return grad_input, None, None, None, None
+
+
 @dataclass
 class _StreamAsyncAllToAll:
     output: torch.Tensor
@@ -87,7 +115,11 @@ class _StreamAsyncAllToAll:
 
     def wait_current_stream(self) -> torch.Tensor:
         if self.work is not None:
-            self.work.wait()
+            if isinstance(self.work, (list, tuple)):
+                for work in self.work:
+                    work.wait()
+            else:
+                self.work.wait()
         torch.cuda.current_stream().wait_event(self.event)
         return self.output
 
@@ -1099,6 +1131,151 @@ class MoEStreamAlltoAllTokenDispatcherV1(MoEAlltoAllTokenDispatcher):
             return None
         return tuple(int(size) for size in split_sizes)
 
+    @staticmethod
+    def _split_offsets(split_sizes: tuple[int, ...]) -> list[int]:
+        offsets = [0]
+        running = 0
+        for size in split_sizes[:-1]:
+            running += int(size)
+            offsets.append(running)
+        return offsets
+
+    @staticmethod
+    def _sparse_all_to_all_sync(
+        group,
+        input_: torch.Tensor,
+        output_split_sizes: Optional[tuple[int, ...]],
+        input_split_sizes: Optional[tuple[int, ...]],
+    ) -> torch.Tensor:
+        output_split_sizes = MoEStreamAlltoAllTokenDispatcherV1._normalize_split_sizes(
+            output_split_sizes
+        )
+        input_split_sizes = MoEStreamAlltoAllTokenDispatcherV1._normalize_split_sizes(
+            input_split_sizes
+        )
+        if torch.distributed.get_world_size(group=group) == 1:
+            return input_
+        if output_split_sizes is None or input_split_sizes is None:
+            raise ValueError("Sparse StreamMoE exchange requires explicit split sizes.")
+
+        input_ = input_.contiguous()
+        output = input_.new_empty(
+            size=[sum(output_split_sizes)] + list(input_.size()[1:]),
+            dtype=input_.dtype,
+            device=input_.device,
+        )
+        rank = torch.distributed.get_rank(group=group)
+        world_size = torch.distributed.get_world_size(group=group)
+        send_offsets = MoEStreamAlltoAllTokenDispatcherV1._split_offsets(input_split_sizes)
+        recv_offsets = MoEStreamAlltoAllTokenDispatcherV1._split_offsets(output_split_sizes)
+
+        ops = []
+        for peer in range(world_size):
+            recv_size = output_split_sizes[peer]
+            send_size = input_split_sizes[peer]
+            if peer == rank:
+                if recv_size > 0:
+                    output.narrow(0, recv_offsets[peer], recv_size).copy_(
+                        input_.narrow(0, send_offsets[peer], send_size)
+                    )
+                continue
+            if recv_size > 0:
+                ops.append(
+                    torch.distributed.P2POp(
+                        torch.distributed.irecv,
+                        output.narrow(0, recv_offsets[peer], recv_size),
+                        peer,
+                        group,
+                    )
+                )
+            if send_size > 0:
+                ops.append(
+                    torch.distributed.P2POp(
+                        torch.distributed.isend,
+                        input_.narrow(0, send_offsets[peer], send_size),
+                        peer,
+                        group,
+                    )
+                )
+        if ops:
+            works = torch.distributed.batch_isend_irecv(ops)
+            for work in works:
+                work.wait()
+        return output
+
+    def _sparse_all_to_all_async(
+        self,
+        input_: torch.Tensor,
+        output_split_sizes: Optional[Any],
+        input_split_sizes: Optional[Any],
+    ) -> _StreamAsyncAllToAll:
+        """Launch an async sparse peer exchange on the StreamMoE communication stream."""
+
+        output_split_sizes = self._normalize_split_sizes(output_split_sizes)
+        input_split_sizes = self._normalize_split_sizes(input_split_sizes)
+
+        if self.ep_group.size() == 1:
+            event = torch.cuda.current_stream().record_event()
+            return _StreamAsyncAllToAll(output=input_, event=event, work=None)
+        if output_split_sizes is None or input_split_sizes is None:
+            raise ValueError("Sparse StreamMoE exchange requires explicit split sizes.")
+
+        input_ = input_.contiguous()
+        output = input_.new_empty(
+            size=[sum(output_split_sizes)] + list(input_.size()[1:]),
+            dtype=input_.dtype,
+            device=torch.cuda.current_device(),
+        )
+        rank = utils.get_pg_rank(self.ep_group)
+        send_offsets = self._split_offsets(input_split_sizes)
+        recv_offsets = self._split_offsets(output_split_sizes)
+
+        current_stream = torch.cuda.current_stream()
+        self.stream_comm_stream.wait_stream(current_stream)
+        with torch.cuda.stream(self.stream_comm_stream):
+            ops = []
+            for peer in range(self.ep_group.size()):
+                recv_size = output_split_sizes[peer]
+                send_size = input_split_sizes[peer]
+                if peer == rank:
+                    if recv_size > 0:
+                        output.narrow(0, recv_offsets[peer], recv_size).copy_(
+                            input_.narrow(0, send_offsets[peer], send_size)
+                        )
+                    continue
+                if recv_size > 0:
+                    ops.append(
+                        torch.distributed.P2POp(
+                            torch.distributed.irecv,
+                            output.narrow(0, recv_offsets[peer], recv_size),
+                            peer,
+                            self.ep_group,
+                        )
+                    )
+                if send_size > 0:
+                    ops.append(
+                        torch.distributed.P2POp(
+                            torch.distributed.isend,
+                            input_.narrow(0, send_offsets[peer], send_size),
+                            peer,
+                            self.ep_group,
+                        )
+                    )
+            works = torch.distributed.batch_isend_irecv(ops) if ops else []
+            event = self.stream_comm_stream.record_event()
+        input_.record_stream(self.stream_comm_stream)
+        output.record_stream(self.stream_comm_stream)
+        if input_.requires_grad:
+            output = _StreamAsyncSparseExchangeAlias.apply(
+                input_,
+                output,
+                output_split_sizes,
+                input_split_sizes,
+                self.ep_group,
+            )
+            output.record_stream(self.stream_comm_stream)
+        return _StreamAsyncAllToAll(output=output, event=event, work=works)
+
     def _launch_stream_payload_dispatch(
         self,
         payload: torch.Tensor,
@@ -1374,6 +1551,24 @@ class MoEStreamAlltoAllTokenDispatcherV1(MoEAlltoAllTokenDispatcher):
 class MoEStreamAlltoAllTokenDispatcherV2(MoEStreamAlltoAllTokenDispatcherV1):
     """Direct-flow StreamMoE dispatcher that keeps token state on expert ranks across rounds."""
 
+    def _launch_stream_v2_payload_dispatch(
+        self,
+        payload: torch.Tensor,
+        state: dict[str, Any],
+    ) -> _StreamAsyncAllToAll:
+        permuted_payload = payload.index_select(0, state["reversed_local_input_permutation_mapping"])
+        if self.config.moe_stream_v2_sparse_comm:
+            return self._sparse_all_to_all_async(
+                permuted_payload,
+                state["output_splits"],
+                state["input_splits"],
+            )
+        return self._all_to_all_async(
+            permuted_payload,
+            state["output_splits"],
+            state["input_splits"],
+        )
+
     def prepare_stream_v2_round_dispatch(
         self,
         round_expert_indices: torch.LongTensor,
@@ -1393,11 +1588,11 @@ class MoEStreamAlltoAllTokenDispatcherV2(MoEStreamAlltoAllTokenDispatcherV1):
     ) -> _StreamV2RoundStateWork:
         """Dispatch the compact V2 token state for one direct-flow round."""
 
-        x_work = self._launch_stream_payload_dispatch(x, state)
-        acc_work = self._launch_stream_payload_dispatch(acc, state)
-        global_token_ids_work = self._launch_stream_payload_dispatch(global_token_ids, state)
-        remaining_probs_work = self._launch_stream_payload_dispatch(remaining_probs, state)
-        remaining_slot_ids_work = self._launch_stream_payload_dispatch(remaining_slot_ids, state)
+        x_work = self._launch_stream_v2_payload_dispatch(x, state)
+        acc_work = self._launch_stream_v2_payload_dispatch(acc, state)
+        global_token_ids_work = self._launch_stream_v2_payload_dispatch(global_token_ids, state)
+        remaining_probs_work = self._launch_stream_v2_payload_dispatch(remaining_probs, state)
+        remaining_slot_ids_work = self._launch_stream_v2_payload_dispatch(remaining_slot_ids, state)
         return _StreamV2RoundStateWork(
             state=state,
             x_work=x_work,
@@ -1454,9 +1649,14 @@ class MoEStreamAlltoAllTokenDispatcherV2(MoEStreamAlltoAllTokenDispatcherV1):
         """Dispatch the accumulated outputs back to the home ranks."""
 
         state = self.prepare_stream_home_dispatch(global_token_ids, num_tokens_per_home_rank)
+        launch_fn = (
+            self._launch_stream_v2_payload_dispatch
+            if self.config.moe_stream_v2_sparse_comm
+            else self._launch_stream_payload_dispatch
+        )
         return _StreamV2HomeCombineWork(
-            acc_work=self._launch_stream_payload_dispatch(acc, state),
-            global_token_ids_work=self._launch_stream_payload_dispatch(global_token_ids, state),
+            acc_work=launch_fn(acc, state),
+            global_token_ids_work=launch_fn(global_token_ids, state),
         )
 
     def finish_stream_v2_home_combine(

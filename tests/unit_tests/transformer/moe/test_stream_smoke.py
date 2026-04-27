@@ -18,6 +18,7 @@ def _make_config(
     dispatcher_type: str,
     grouped_gemm: bool,
     stream_overlap: bool,
+    stream_v2_sparse_comm: bool,
     stream_version: str,
     hidden_size: int,
     num_attention_heads: int,
@@ -36,6 +37,7 @@ def _make_config(
         moe_token_dispatcher_type=dispatcher_type,
         moe_stream_version=stream_version,
         moe_stream_overlap=stream_overlap,
+        moe_stream_v2_sparse_comm=stream_v2_sparse_comm,
         moe_router_load_balancing_type="aux_loss",
         moe_router_topk=moe_router_topk,
         moe_aux_loss_coeff=moe_aux_loss_coeff,
@@ -139,6 +141,7 @@ def _measure_dispatcher(
     *,
     grouped_gemm: bool,
     stream_overlap: bool,
+    stream_v2_sparse_comm: bool,
     stream_version: str,
     hidden_size: int,
     num_attention_heads: int,
@@ -153,6 +156,7 @@ def _measure_dispatcher(
         grouped_gemm=grouped_gemm,
         stream_version=stream_version,
         stream_overlap=stream_overlap,
+        stream_v2_sparse_comm=stream_v2_sparse_comm,
         hidden_size=hidden_size,
         num_attention_heads=num_attention_heads,
         num_moe_experts=num_moe_experts,
@@ -197,6 +201,7 @@ def run_stream_vs_alltoall_parity(
     *,
     grouped_gemm: bool = False,
     stream_overlap: bool = False,
+    stream_v2_sparse_comm: bool = False,
     stream_version: str = "v1",
     seq_len: int = 16,
     micro_batch_size: int = 4,
@@ -220,6 +225,7 @@ def run_stream_vs_alltoall_parity(
             grouped_gemm=grouped_gemm,
             stream_version="v1",
             stream_overlap=False,
+            stream_v2_sparse_comm=False,
             hidden_size=hidden_size,
             num_attention_heads=num_attention_heads,
             num_moe_experts=num_moe_experts,
@@ -249,6 +255,7 @@ def run_stream_vs_alltoall_parity(
             grouped_gemm=grouped_gemm,
             stream_version="v1",
             stream_overlap=False,
+            stream_v2_sparse_comm=False,
             hidden_size=hidden_size,
             num_attention_heads=num_attention_heads,
             num_moe_experts=num_moe_experts,
@@ -265,6 +272,7 @@ def run_stream_vs_alltoall_parity(
             grouped_gemm=grouped_gemm,
             stream_version=stream_version,
             stream_overlap=stream_overlap,
+            stream_v2_sparse_comm=stream_v2_sparse_comm,
             hidden_size=hidden_size,
             num_attention_heads=num_attention_heads,
             num_moe_experts=num_moe_experts,
@@ -309,6 +317,7 @@ def run_stream_vs_alltoall_parity(
                 f"[stream smoke] grouped_gemm={grouped_gemm} dtype={dtype} "
                 f"stream_version={stream_version} "
                 f"stream_overlap={stream_overlap} "
+                f"stream_v2_sparse_comm={stream_v2_sparse_comm} "
                 f"shape=({seq_len},{micro_batch_size},{hidden_size}) topk={moe_router_topk} "
                 f"num_experts={num_moe_experts} ffn={moe_ffn_hidden_size} "
                 f"aux={moe_aux_loss_coeff} "
@@ -330,6 +339,7 @@ def run_single_dispatcher_benchmark(
     dispatcher_type: str,
     grouped_gemm: bool = False,
     stream_overlap: bool = False,
+    stream_v2_sparse_comm: bool = False,
     stream_version: str = "v1",
     seq_len: int = 16,
     micro_batch_size: int = 4,
@@ -354,6 +364,7 @@ def run_single_dispatcher_benchmark(
             grouped_gemm=grouped_gemm,
             stream_version=stream_version if dispatcher_type == "stream" else "v1",
             stream_overlap=stream_overlap and dispatcher_type == "stream",
+            stream_v2_sparse_comm=stream_v2_sparse_comm and dispatcher_type == "stream",
             hidden_size=hidden_size,
             num_attention_heads=num_attention_heads,
             num_moe_experts=num_moe_experts,
@@ -402,6 +413,7 @@ def run_single_dispatcher_benchmark(
                 f"[stream benchmark] dispatcher={dispatcher_type} grouped_gemm={grouped_gemm} "
                 f"stream_version={stream_version if dispatcher_type == 'stream' else 'v1'} "
                 f"stream_overlap={stream_overlap and dispatcher_type == 'stream'} "
+                f"stream_v2_sparse_comm={stream_v2_sparse_comm and dispatcher_type == 'stream'} "
                 f"dtype={dtype} shape=({seq_len},{micro_batch_size},{hidden_size}) "
                 f"topk={moe_router_topk} num_experts={num_moe_experts} "
                 f"ffn={moe_ffn_hidden_size} aux={moe_aux_loss_coeff} "
@@ -438,6 +450,7 @@ def main() -> None:
     parser.add_argument("--grouped-gemm", action="store_true")
     parser.add_argument("--stream-version", choices=["v1", "v2"], default="v1")
     parser.add_argument("--stream-overlap", action="store_true")
+    parser.add_argument("--stream-v2-sparse-comm", action="store_true")
     parser.add_argument("--seq-len", type=int, default=16)
     parser.add_argument("--micro-batch-size", type=int, default=4)
     parser.add_argument("--hidden-size", type=int, default=64)
@@ -460,6 +473,7 @@ def main() -> None:
         grouped_gemm=args.grouped_gemm,
         stream_version=args.stream_version,
         stream_overlap=args.stream_overlap,
+        stream_v2_sparse_comm=args.stream_v2_sparse_comm,
         seq_len=args.seq_len,
         micro_batch_size=args.micro_batch_size,
         hidden_size=args.hidden_size,
