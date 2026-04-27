@@ -129,21 +129,6 @@ class _StreamV2RoundStateWork:
 
 
 @dataclass
-class _StreamV2RoundPrefetchWork:
-    state: dict[str, Any]
-    x_work: _StreamAsyncAllToAll
-    global_token_ids_work: _StreamAsyncAllToAll
-    remaining_probs_work: _StreamAsyncAllToAll
-    remaining_slot_ids_work: _StreamAsyncAllToAll
-
-
-@dataclass
-class _StreamV2SplitRoundStateWork:
-    prefetch_work: _StreamV2RoundPrefetchWork
-    acc_work: _StreamAsyncAllToAll
-
-
-@dataclass
 class _StreamV2TokenState:
     x: torch.Tensor
     current_probs: torch.Tensor
@@ -1422,47 +1407,6 @@ class MoEStreamAlltoAllTokenDispatcherV2(MoEStreamAlltoAllTokenDispatcherV1):
             remaining_slot_ids_work=remaining_slot_ids_work,
         )
 
-    def start_stream_v2_round_prefetch(
-        self,
-        state: dict[str, Any],
-        x: torch.Tensor,
-        global_token_ids: torch.Tensor,
-        remaining_probs: torch.Tensor,
-        remaining_slot_ids: torch.Tensor,
-    ) -> _StreamV2RoundPrefetchWork:
-        """Pre-dispatch the next V2 round's x/metadata before acc is ready."""
-
-        return _StreamV2RoundPrefetchWork(
-            state=state,
-            x_work=self._launch_stream_payload_dispatch(x, state),
-            global_token_ids_work=self._launch_stream_payload_dispatch(global_token_ids, state),
-            remaining_probs_work=self._launch_stream_payload_dispatch(remaining_probs, state),
-            remaining_slot_ids_work=self._launch_stream_payload_dispatch(
-                remaining_slot_ids, state
-            ),
-        )
-
-    def start_stream_v2_round_acc_dispatch(
-        self,
-        state: dict[str, Any],
-        acc: torch.Tensor,
-    ) -> _StreamAsyncAllToAll:
-        """Dispatch only the accumulator payload for the next V2 round."""
-
-        return self._launch_stream_payload_dispatch(acc, state)
-
-    def build_stream_v2_split_round_dispatch(
-        self,
-        prefetch_work: _StreamV2RoundPrefetchWork,
-        acc_work: _StreamAsyncAllToAll,
-    ) -> _StreamV2SplitRoundStateWork:
-        """Bundle a two-phase V2 dispatch into one handle for the next round."""
-
-        return _StreamV2SplitRoundStateWork(
-            prefetch_work=prefetch_work,
-            acc_work=acc_work,
-        )
-
     def finish_stream_v2_round_dispatch(
         self,
         work: _StreamV2RoundStateWork,
@@ -1483,37 +1427,6 @@ class MoEStreamAlltoAllTokenDispatcherV2(MoEStreamAlltoAllTokenDispatcherV1):
             remaining_probs=received_remaining_probs[:, 1:],
             remaining_slot_ids=received_remaining_slot_ids[:, 1:],
         )
-
-    def finish_stream_v2_split_round_dispatch(
-        self,
-        work: _StreamV2SplitRoundStateWork,
-    ) -> _StreamV2TokenState:
-        """Finish a V2 round whose x/metadata and acc were dispatched in two phases."""
-
-        self._restore_stream_state(work.prefetch_work.state)
-        x = work.prefetch_work.x_work.wait_current_stream()
-        global_token_ids = work.prefetch_work.global_token_ids_work.wait_current_stream()
-        received_remaining_probs = work.prefetch_work.remaining_probs_work.wait_current_stream()
-        received_remaining_slot_ids = work.prefetch_work.remaining_slot_ids_work.wait_current_stream()
-        acc = work.acc_work.wait_current_stream()
-        return _StreamV2TokenState(
-            x=x,
-            current_probs=received_remaining_probs[:, 0],
-            acc=acc,
-            global_token_ids=global_token_ids,
-            remaining_probs=received_remaining_probs[:, 1:],
-            remaining_slot_ids=received_remaining_slot_ids[:, 1:],
-        )
-
-    def finish_stream_v2_state_dispatch(
-        self,
-        work: _StreamV2RoundStateWork | _StreamV2SplitRoundStateWork,
-    ) -> _StreamV2TokenState:
-        """Finish either a normal or overlapped V2 round-state dispatch."""
-
-        if isinstance(work, _StreamV2SplitRoundStateWork):
-            return self.finish_stream_v2_split_round_dispatch(work)
-        return self.finish_stream_v2_round_dispatch(work)
 
     def prepare_stream_home_dispatch(
         self,
