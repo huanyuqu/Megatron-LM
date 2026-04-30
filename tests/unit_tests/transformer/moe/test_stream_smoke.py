@@ -1,4 +1,6 @@
 import argparse
+from contextlib import nullcontext
+import time
 from typing import Any
 
 import torch
@@ -7,7 +9,12 @@ try:
 except ModuleNotFoundError:  # pragma: no cover - script mode on lightweight envs.
     pytest = None
 
-from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_local_submodules
+from megatron.core.models.gpt.gpt_layer_specs import (
+    get_gpt_layer_local_spec,
+    get_gpt_layer_local_submodules,
+)
+from megatron.core.models.gpt.gpt_model import GPTModel
+from megatron.core.transformer.transformer_block import TransformerBlock
 from megatron.core.transformer.moe.moe_layer import MoELayer
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.training.initialize import _set_random_seed
@@ -19,7 +26,12 @@ def _make_config(
     grouped_gemm: bool,
     stream_overlap: bool,
     stream_v2_sparse_comm: bool,
+    stream_v2_local_first: bool,
     stream_version: str,
+    recompute_mode: str,
+    recompute_num_layers: int | None,
+    ep_size: int,
+    num_layers: int,
     hidden_size: int,
     num_attention_heads: int,
     num_moe_experts: int,
@@ -28,8 +40,32 @@ def _make_config(
     dtype: torch.dtype,
     moe_aux_loss_coeff: float,
 ) -> TransformerConfig:
+    if recompute_mode == "moe":
+        recompute_kwargs = dict(
+            recompute_granularity="selective",
+            recompute_method=None,
+            recompute_num_layers=None,
+            recompute_modules=["moe"],
+        )
+    elif recompute_mode == "full":
+        recompute_kwargs = dict(
+            recompute_granularity="full",
+            recompute_method="uniform",
+            recompute_num_layers=recompute_num_layers or 1,
+            recompute_modules=None,
+        )
+    elif recompute_mode == "none":
+        recompute_kwargs = dict(
+            recompute_granularity=None,
+            recompute_method=None,
+            recompute_num_layers=None,
+            recompute_modules=None,
+        )
+    else:
+        raise ValueError(f"Unsupported recompute_mode: {recompute_mode}")
+
     return TransformerConfig(
-        num_layers=1,
+        num_layers=num_layers,
         hidden_size=hidden_size,
         num_attention_heads=num_attention_heads,
         num_moe_experts=num_moe_experts,
@@ -38,6 +74,7 @@ def _make_config(
         moe_stream_version=stream_version,
         moe_stream_overlap=stream_overlap,
         moe_stream_v2_sparse_comm=stream_v2_sparse_comm,
+        moe_stream_v2_local_first=stream_v2_local_first,
         moe_router_load_balancing_type="aux_loss",
         moe_router_topk=moe_router_topk,
         moe_aux_loss_coeff=moe_aux_loss_coeff,
@@ -45,10 +82,9 @@ def _make_config(
         moe_ffn_hidden_size=moe_ffn_hidden_size,
         add_bias_linear=False,
         tensor_model_parallel_size=1,
-        expert_model_parallel_size=2,
+        expert_model_parallel_size=ep_size,
         sequence_parallel=False,
-        recompute_granularity="selective",
-        recompute_modules=["moe"],
+        **recompute_kwargs,
         moe_router_dtype="fp32",
         bf16=dtype == torch.bfloat16,
         fp16=dtype == torch.float16,
@@ -56,14 +92,70 @@ def _make_config(
     )
 
 
-def _build_moe_layer(config: TransformerConfig) -> MoELayer:
+def _build_moe_layer(config: TransformerConfig, layer_number: int = 0) -> MoELayer:
     submodules = get_gpt_layer_local_submodules(
         num_experts=config.num_moe_experts, moe_grouped_gemm=config.moe_grouped_gemm
     )
     moe_layer = MoELayer(config, submodules.mlp.submodules).cuda()
     moe_layer.train()
-    moe_layer.set_layer_number(0)
+    moe_layer.set_layer_number(layer_number)
     return moe_layer
+
+
+def _build_moe_stack(config: TransformerConfig) -> torch.nn.ModuleList:
+    return torch.nn.ModuleList(
+        [_build_moe_layer(config, layer_number=i + 1) for i in range(config.num_layers)]
+    ).cuda()
+
+
+def _build_transformer_stack(config: TransformerConfig) -> TransformerBlock:
+    block = TransformerBlock(
+        config,
+        get_gpt_layer_local_spec(
+            num_experts=config.num_moe_experts,
+            moe_grouped_gemm=config.moe_grouped_gemm,
+        ),
+    ).cuda()
+    if config.params_dtype != torch.float32:
+        block = block.to(dtype=config.params_dtype)
+    return block
+
+
+def _build_gpt_stack(config: TransformerConfig, max_sequence_length: int) -> GPTModel:
+    model = GPTModel(
+        config=config,
+        transformer_layer_spec=get_gpt_layer_local_spec(
+            num_experts=config.num_moe_experts,
+            moe_grouped_gemm=config.moe_grouped_gemm,
+        ),
+        vocab_size=32000,
+        max_sequence_length=max_sequence_length,
+        pre_process=False,
+        post_process=False,
+        position_embedding_type="none",
+    ).cuda()
+    if config.params_dtype != torch.float32:
+        model = model.to(dtype=config.params_dtype)
+    model.train()
+    return model
+
+
+def _activation_offload_context(enabled: bool):
+    if not enabled:
+        return nullcontext()
+
+    def pack(tensor: torch.Tensor):
+        if tensor.is_cuda:
+            return tensor.device, tensor.detach().cpu()
+        return None, tensor
+
+    def unpack(packed):
+        device, tensor = packed
+        if device is None:
+            return tensor
+        return tensor.to(device, non_blocking=True)
+
+    return torch.autograd.graph.saved_tensors_hooks(pack, unpack)
 
 
 def _is_rank_zero() -> bool:
@@ -142,7 +234,12 @@ def _measure_dispatcher(
     grouped_gemm: bool,
     stream_overlap: bool,
     stream_v2_sparse_comm: bool,
+    stream_v2_local_first: bool,
     stream_version: str,
+    recompute_mode: str,
+    recompute_num_layers: int | None,
+    ep_size: int,
+    num_layers: int,
     hidden_size: int,
     num_attention_heads: int,
     num_moe_experts: int,
@@ -157,6 +254,11 @@ def _measure_dispatcher(
         stream_version=stream_version,
         stream_overlap=stream_overlap,
         stream_v2_sparse_comm=stream_v2_sparse_comm,
+        stream_v2_local_first=stream_v2_local_first,
+        recompute_mode=recompute_mode,
+        recompute_num_layers=recompute_num_layers,
+        ep_size=ep_size,
+        num_layers=num_layers,
         hidden_size=hidden_size,
         num_attention_heads=num_attention_heads,
         num_moe_experts=num_moe_experts,
@@ -199,10 +301,15 @@ def _measure_dispatcher(
 
 def run_stream_vs_alltoall_parity(
     *,
+    ep_size: int = 2,
+    num_layers: int = 1,
     grouped_gemm: bool = False,
     stream_overlap: bool = False,
     stream_v2_sparse_comm: bool = False,
+    stream_v2_local_first: bool = True,
     stream_version: str = "v1",
+    recompute_mode: str = "moe",
+    recompute_num_layers: int | None = None,
     seq_len: int = 16,
     micro_batch_size: int = 4,
     hidden_size: int = 64,
@@ -212,11 +319,11 @@ def run_stream_vs_alltoall_parity(
     dtype: torch.dtype = torch.float32,
     moe_aux_loss_coeff: float = 0.01,
 ) -> None:
-    if torch.cuda.device_count() < 2:
-        raise RuntimeError("Stream MoE EP smoke test requires at least 2 CUDA devices.")
+    if torch.cuda.device_count() < ep_size:
+        raise RuntimeError(f"Stream MoE EP smoke test requires at least {ep_size} CUDA devices.")
 
     try:
-        Utils.initialize_model_parallel(tensor_model_parallel_size=1, expert_model_parallel_size=2)
+        Utils.initialize_model_parallel(tensor_model_parallel_size=1, expert_model_parallel_size=ep_size)
         _set_random_seed(seed_=123, data_parallel_random_init=False)
         num_attention_heads = max(1, hidden_size // 64)
 
@@ -226,6 +333,11 @@ def run_stream_vs_alltoall_parity(
             stream_version="v1",
             stream_overlap=False,
             stream_v2_sparse_comm=False,
+            stream_v2_local_first=True,
+            recompute_mode="moe",
+            recompute_num_layers=None,
+            ep_size=ep_size,
+            num_layers=1,
             hidden_size=hidden_size,
             num_attention_heads=num_attention_heads,
             num_moe_experts=num_moe_experts,
@@ -256,6 +368,11 @@ def run_stream_vs_alltoall_parity(
             stream_version="v1",
             stream_overlap=False,
             stream_v2_sparse_comm=False,
+            stream_v2_local_first=True,
+            recompute_mode=recompute_mode,
+            recompute_num_layers=recompute_num_layers,
+            ep_size=ep_size,
+            num_layers=num_layers,
             hidden_size=hidden_size,
             num_attention_heads=num_attention_heads,
             num_moe_experts=num_moe_experts,
@@ -273,6 +390,11 @@ def run_stream_vs_alltoall_parity(
             stream_version=stream_version,
             stream_overlap=stream_overlap,
             stream_v2_sparse_comm=stream_v2_sparse_comm,
+            stream_v2_local_first=stream_v2_local_first,
+            recompute_mode=recompute_mode,
+            recompute_num_layers=recompute_num_layers,
+            ep_size=ep_size,
+            num_layers=num_layers,
             hidden_size=hidden_size,
             num_attention_heads=num_attention_heads,
             num_moe_experts=num_moe_experts,
@@ -337,10 +459,16 @@ def run_stream_vs_alltoall_parity(
 def run_single_dispatcher_benchmark(
     *,
     dispatcher_type: str,
+    layer_kind: str = "moe",
+    ep_size: int = 2,
+    num_layers: int = 1,
     grouped_gemm: bool = False,
     stream_overlap: bool = False,
     stream_v2_sparse_comm: bool = False,
+    stream_v2_local_first: bool = True,
     stream_version: str = "v1",
+    recompute_mode: str = "moe",
+    recompute_num_layers: int | None = None,
     seq_len: int = 16,
     micro_batch_size: int = 4,
     hidden_size: int = 64,
@@ -349,14 +477,16 @@ def run_single_dispatcher_benchmark(
     moe_router_topk: int = 2,
     dtype: torch.dtype = torch.float32,
     moe_aux_loss_coeff: float = 0.01,
+    activation_offload: bool = False,
+    grad_accum_steps: int = 1,
     warmup: int = 2,
     iters: int = 5,
 ) -> None:
-    if torch.cuda.device_count() < 2:
-        raise RuntimeError("Stream MoE benchmark requires at least 2 CUDA devices.")
+    if torch.cuda.device_count() < ep_size:
+        raise RuntimeError(f"Stream MoE benchmark requires at least {ep_size} CUDA devices.")
 
     try:
-        Utils.initialize_model_parallel(tensor_model_parallel_size=1, expert_model_parallel_size=2)
+        Utils.initialize_model_parallel(tensor_model_parallel_size=1, expert_model_parallel_size=ep_size)
         _set_random_seed(seed_=123, data_parallel_random_init=False)
         num_attention_heads = max(1, hidden_size // 64)
         config = _make_config(
@@ -365,6 +495,11 @@ def run_single_dispatcher_benchmark(
             stream_version=stream_version if dispatcher_type == "stream" else "v1",
             stream_overlap=stream_overlap and dispatcher_type == "stream",
             stream_v2_sparse_comm=stream_v2_sparse_comm and dispatcher_type == "stream",
+            stream_v2_local_first=stream_v2_local_first,
+            recompute_mode=recompute_mode,
+            recompute_num_layers=recompute_num_layers,
+            ep_size=ep_size,
+            num_layers=num_layers,
             hidden_size=hidden_size,
             num_attention_heads=num_attention_heads,
             num_moe_experts=num_moe_experts,
@@ -373,7 +508,14 @@ def run_single_dispatcher_benchmark(
             dtype=dtype,
             moe_aux_loss_coeff=moe_aux_loss_coeff,
         )
-        layer = _build_moe_layer(config)
+        if layer_kind == "moe":
+            model = _build_moe_stack(config)
+        elif layer_kind == "transformer":
+            model = _build_transformer_stack(config)
+        elif layer_kind == "gpt":
+            model = _build_gpt_stack(config, max_sequence_length=seq_len)
+        else:
+            raise ValueError(f"Unsupported layer_kind: {layer_kind}")
 
         hidden_states_cpu = torch.randn(
             seq_len,
@@ -382,13 +524,45 @@ def run_single_dispatcher_benchmark(
             dtype=dtype,
         )
         grad_output_cpu = torch.randn_like(hidden_states_cpu)
+        attention_mask = torch.ones(
+            (1, 1, seq_len, seq_len),
+            dtype=torch.bool,
+            device="cuda",
+        )
+        input_ids = torch.empty(
+            (micro_batch_size, seq_len),
+            dtype=torch.long,
+            device="cuda",
+        )
+        position_ids = (
+            torch.arange(seq_len, dtype=torch.long, device="cuda")
+            .unsqueeze(0)
+            .expand(micro_batch_size, -1)
+        )
+
+        grad_accum_steps = max(1, int(grad_accum_steps))
 
         def run_once():
-            layer.zero_grad(set_to_none=True)
-            hidden_states = hidden_states_cpu.cuda().detach().clone().requires_grad_(True)
-            grad_output = grad_output_cpu.cuda()
-            output, _ = layer(hidden_states)
-            output.backward(grad_output)
+            model.zero_grad(set_to_none=True)
+            output = None
+            with _activation_offload_context(activation_offload):
+                for _ in range(grad_accum_steps):
+                    hidden_states = hidden_states_cpu.cuda().detach().clone().requires_grad_(True)
+                    grad_output = grad_output_cpu.cuda()
+                    if layer_kind == "moe":
+                        output = hidden_states
+                        for layer in model:
+                            output, _ = layer(output)
+                    elif layer_kind == "gpt":
+                        model.set_input_tensor(hidden_states)
+                        output = model(
+                            input_ids=input_ids,
+                            position_ids=position_ids,
+                            attention_mask=attention_mask,
+                        )
+                    else:
+                        output = model(hidden_states=hidden_states, attention_mask=attention_mask)
+                    output.backward(grad_output)
             return output
 
         for _ in range(warmup):
@@ -398,22 +572,26 @@ def run_single_dispatcher_benchmark(
         torch.cuda.reset_peak_memory_stats()
         baseline = torch.cuda.memory_allocated()
 
-        start = torch.cuda.Event(enable_timing=True)
-        end = torch.cuda.Event(enable_timing=True)
-        start.record()
+        torch.cuda.synchronize()
+        start_time = time.perf_counter()
         for _ in range(iters):
             run_once()
-        end.record()
         torch.cuda.synchronize()
         peak = torch.cuda.max_memory_allocated()
-        elapsed_ms = start.elapsed_time(end) / max(1, iters)
+        elapsed_ms = (time.perf_counter() - start_time) * 1000.0 / max(1, iters)
 
         if torch.distributed.get_rank() == 0:
             print(
-                f"[stream benchmark] dispatcher={dispatcher_type} grouped_gemm={grouped_gemm} "
+                f"[stream benchmark] dispatcher={dispatcher_type} ep_size={ep_size} "
+                f"layer_kind={layer_kind} num_layers={num_layers} grouped_gemm={grouped_gemm} "
                 f"stream_version={stream_version if dispatcher_type == 'stream' else 'v1'} "
                 f"stream_overlap={stream_overlap and dispatcher_type == 'stream'} "
                 f"stream_v2_sparse_comm={stream_v2_sparse_comm and dispatcher_type == 'stream'} "
+                f"stream_v2_local_first={stream_v2_local_first and dispatcher_type == 'stream'} "
+                f"activation_offload={activation_offload} "
+                f"grad_accum_steps={grad_accum_steps} "
+                f"recompute_mode={recompute_mode} "
+                f"recompute_num_layers={recompute_num_layers if recompute_mode == 'full' else None} "
                 f"dtype={dtype} shape=({seq_len},{micro_batch_size},{hidden_size}) "
                 f"topk={moe_router_topk} num_experts={num_moe_experts} "
                 f"ffn={moe_ffn_hidden_size} aux={moe_aux_loss_coeff} "
@@ -447,10 +625,37 @@ def main() -> None:
         help="compare checks alltoall vs stream parity; benchmark runs one dispatcher per process.",
     )
     parser.add_argument("--dispatcher", choices=["alltoall", "stream"], default="stream")
+    parser.add_argument(
+        "--layer-kind",
+        choices=["moe", "transformer", "gpt"],
+        default="moe",
+        help=(
+            "Benchmark only the MoE sublayer, direct TransformerBlock, or official "
+            "GPTModel without embedding/output layers."
+        ),
+    )
+    parser.add_argument("--ep-size", type=int, default=2)
+    parser.add_argument("--num-layers", type=int, default=1)
     parser.add_argument("--grouped-gemm", action="store_true")
     parser.add_argument("--stream-version", choices=["v1", "v2"], default="v1")
     parser.add_argument("--stream-overlap", action="store_true")
     parser.add_argument("--stream-v2-sparse-comm", action="store_true")
+    parser.add_argument(
+        "--stream-v2-no-local-first",
+        action="store_true",
+        help="Disable StreamMoE v2 current-rank-first path manipulation.",
+    )
+    parser.add_argument(
+        "--activation-offload",
+        action="store_true",
+        help="Use saved-tensor CPU offload as an EP memory-saving baseline.",
+    )
+    parser.add_argument(
+        "--grad-accum-steps",
+        type=int,
+        default=1,
+        help="Run this many sequential microbatches per measured optimizer step.",
+    )
     parser.add_argument("--seq-len", type=int, default=16)
     parser.add_argument("--micro-batch-size", type=int, default=4)
     parser.add_argument("--hidden-size", type=int, default=64)
@@ -458,6 +663,21 @@ def main() -> None:
     parser.add_argument("--num-experts", type=int, default=4)
     parser.add_argument("--topk", type=int, default=2)
     parser.add_argument("--aux-loss-coeff", type=float, default=0.01)
+    parser.add_argument(
+        "--recompute-mode",
+        choices=["moe", "full", "none"],
+        default="moe",
+        help=(
+            "Activation recompute policy. The default is selective MoE recompute, "
+            "which is the fair EP baseline for StreamMoE round checkpointing."
+        ),
+    )
+    parser.add_argument(
+        "--recompute-num-layers",
+        type=int,
+        default=None,
+        help="Number of Transformer layers per full-checkpoint segment.",
+    )
     parser.add_argument("--warmup", type=int, default=2)
     parser.add_argument("--iters", type=int, default=5)
     parser.add_argument(
@@ -470,10 +690,15 @@ def main() -> None:
         "fp16": torch.float16,
     }
     common_kwargs = dict(
+        ep_size=args.ep_size,
+        num_layers=args.num_layers,
         grouped_gemm=args.grouped_gemm,
         stream_version=args.stream_version,
         stream_overlap=args.stream_overlap,
         stream_v2_sparse_comm=args.stream_v2_sparse_comm,
+        stream_v2_local_first=not args.stream_v2_no_local_first,
+        recompute_mode=args.recompute_mode,
+        recompute_num_layers=args.recompute_num_layers,
         seq_len=args.seq_len,
         micro_batch_size=args.micro_batch_size,
         hidden_size=args.hidden_size,
@@ -488,6 +713,9 @@ def main() -> None:
     else:
         run_single_dispatcher_benchmark(
             dispatcher_type=args.dispatcher,
+            layer_kind=args.layer_kind,
+            activation_offload=args.activation_offload,
+            grad_accum_steps=args.grad_accum_steps,
             warmup=args.warmup,
             iters=args.iters,
             **common_kwargs,

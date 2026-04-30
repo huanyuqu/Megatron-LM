@@ -760,6 +760,9 @@ class TransformerConfig(ModelParallelConfig):
     moe_stream_v2_sparse_comm: bool = False
     """Enable experimental sparse peer-to-peer communication for StreamMoE v2 token-state hops."""
 
+    moe_stream_v2_local_first: bool = True
+    """Prefer current-rank experts when selecting StreamMoE v2 direct-flow token paths."""
+
     moe_enable_deepep: bool = False
     """[Experimental] Enable DeepEP for efficient token dispatching and combine in MoE models."""
 

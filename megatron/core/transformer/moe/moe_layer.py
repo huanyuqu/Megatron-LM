@@ -897,6 +897,13 @@ class MoELayer(BaseMoELayer):
         current_topk_indices = topk_indices.index_select(0, current_local_token_ids)
         candidate_slot_ids = current_remaining_slot_ids.to(torch.long)
         candidate_expert_indices = current_topk_indices.gather(1, candidate_slot_ids)
+        if not self.config.moe_stream_v2_local_first:
+            round_slot_ids = current_remaining_slot_ids[:, 0].to(torch.long)
+            round_expert_indices = current_topk_indices.gather(
+                1, round_slot_ids.unsqueeze(1)
+            ).squeeze(1)
+            return round_expert_indices, current_remaining_probs, current_remaining_slot_ids
+
         candidate_ranks = torch.div(
             candidate_expert_indices,
             self.num_local_experts,
