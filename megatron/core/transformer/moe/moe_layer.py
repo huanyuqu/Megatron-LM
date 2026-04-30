@@ -221,6 +221,52 @@ class _StreamMoEOverlapCheckpoint(torch.autograd.Function):
         return None, hidden_states.grad, None
 
 
+class _StreamMoEV2FullRecomputeCheckpoint(torch.autograd.Function):
+    """Checkpoint V2 as one direct-flow segment.
+
+    The previous V2 path checkpointed every round independently. That saved the
+    flowing ``x`` and ``acc`` tensors at every boundary, which defeats the point
+    of making the token state stream between experts. This diagnostic wrapper
+    saves only the original layer input and reconstructs the direct-flow segment
+    during backward.
+    """
+
+    @staticmethod
+    def forward(ctx, module, hidden_states, padding_mask):
+        ctx.module = module
+        ctx.has_padding_mask = padding_mask is not None
+        if ctx.has_padding_mask:
+            ctx.save_for_backward(hidden_states, padding_mask)
+        else:
+            ctx.save_for_backward(hidden_states)
+
+        with torch.no_grad():
+            return module._stream_v2_forward(
+                hidden_states,
+                padding_mask,
+                use_round_checkpoint=False,
+            )
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        module = ctx.module
+        saved_tensors = ctx.saved_tensors
+        hidden_states = saved_tensors[0].detach()
+        hidden_states.requires_grad_(saved_tensors[0].requires_grad)
+        padding_mask = saved_tensors[1] if ctx.has_padding_mask else None
+
+        with torch.enable_grad():
+            output = module._stream_v2_forward(
+                hidden_states,
+                padding_mask,
+                use_round_checkpoint=False,
+            )
+            torch.autograd.backward(output, grad_output)
+
+        ctx.module = None
+        return None, hidden_states.grad, None
+
+
 @dataclass
 class MoESubmodules:
     """MoE Layer Submodule spec"""
@@ -737,6 +783,8 @@ class MoELayer(BaseMoELayer):
         self,
         hidden_states: torch.Tensor,
         padding_mask: Optional[torch.Tensor] = None,
+        *,
+        use_round_checkpoint: bool = True,
     ) -> torch.Tensor:
         """Run StreamMoE v2 direct-flow forward.
 
@@ -750,6 +798,7 @@ class MoELayer(BaseMoELayer):
         current_acc, current_global_token_ids = self._stream_v2_forward_pre_home(
             hidden_states,
             padding_mask,
+            use_round_checkpoint=use_round_checkpoint,
         )
         flat_hidden_states = hidden_states.reshape(-1, hidden_states.shape[-1])
         if current_acc.numel() == 0:
@@ -776,6 +825,8 @@ class MoELayer(BaseMoELayer):
         self,
         hidden_states: torch.Tensor,
         padding_mask: Optional[torch.Tensor] = None,
+        *,
+        use_round_checkpoint: bool = True,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Run V2 rounds and return the pre-home-combine accumulator state."""
 
@@ -817,6 +868,17 @@ class MoELayer(BaseMoELayer):
                 current_remaining_slot_ids,
             ) = (
                 self._checkpoint_stream_v2_round(
+                    current_x,
+                    current_acc,
+                    current_global_token_ids,
+                    current_remaining_probs,
+                    current_remaining_slot_ids,
+                    topk_indices,
+                    round_id,
+                    num_tokens_per_home_rank,
+                )
+                if use_round_checkpoint
+                else self._stream_v2_round_forward(
                     current_x,
                     current_acc,
                     current_global_token_ids,
@@ -1133,7 +1195,14 @@ class MoELayer(BaseMoELayer):
                 )
 
             if self.config.moe_stream_version == "v2":
-                output = self._stream_v2_forward(hidden_states, padding_mask)
+                if self.moe_layer_recompute:
+                    output = _StreamMoEV2FullRecomputeCheckpoint.apply(
+                        self,
+                        hidden_states,
+                        padding_mask,
+                    )
+                else:
+                    output = self._stream_v2_forward(hidden_states, padding_mask)
                 return output, None
 
             if self.config.moe_stream_overlap:
