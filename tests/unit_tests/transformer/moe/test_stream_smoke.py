@@ -1,5 +1,6 @@
 import argparse
 from contextlib import nullcontext
+import threading
 import time
 from typing import Any
 
@@ -46,6 +47,13 @@ def _make_config(
             recompute_method=None,
             recompute_num_layers=None,
             recompute_modules=["moe"],
+        )
+    elif recompute_mode == "attn_moe":
+        recompute_kwargs = dict(
+            recompute_granularity="selective",
+            recompute_method=None,
+            recompute_num_layers=None,
+            recompute_modules=["core_attn", "moe"],
         )
     elif recompute_mode == "full":
         recompute_kwargs = dict(
@@ -481,6 +489,7 @@ def run_single_dispatcher_benchmark(
     grad_accum_steps: int = 1,
     warmup: int = 2,
     iters: int = 5,
+    sample_device_memory_peak: bool = False,
 ) -> None:
     if torch.cuda.device_count() < ep_size:
         raise RuntimeError(f"Stream MoE benchmark requires at least {ep_size} CUDA devices.")
@@ -571,14 +580,86 @@ def run_single_dispatcher_benchmark(
         torch.cuda.empty_cache()
         torch.cuda.reset_peak_memory_stats()
         baseline = torch.cuda.memory_allocated()
+        baseline_reserved = torch.cuda.memory_reserved()
+        try:
+            free_memory, total_memory = torch.cuda.mem_get_info()
+            baseline_device = total_memory - free_memory
+        except RuntimeError:
+            baseline_device = baseline_reserved
 
         torch.cuda.synchronize()
+        device_index = torch.cuda.current_device()
+        device_used = baseline_device
+        stop_sampling = threading.Event() if sample_device_memory_peak else None
+
+        def sample_device_peak() -> None:
+            nonlocal device_used
+            with torch.cuda.device(device_index):
+                assert stop_sampling is not None
+                while not stop_sampling.is_set():
+                    try:
+                        free_memory, total_memory = torch.cuda.mem_get_info()
+                        device_used = max(device_used, total_memory - free_memory)
+                    except RuntimeError:
+                        pass
+                    time.sleep(0.005)
+
+        sampler = None
+        if sample_device_memory_peak:
+            sampler = threading.Thread(target=sample_device_peak, daemon=True)
+            sampler.start()
         start_time = time.perf_counter()
-        for _ in range(iters):
-            run_once()
-        torch.cuda.synchronize()
+        try:
+            for _ in range(iters):
+                run_once()
+            torch.cuda.synchronize()
+        finally:
+            if stop_sampling is not None:
+                stop_sampling.set()
+            if sampler is not None:
+                sampler.join()
         peak = torch.cuda.max_memory_allocated()
+        peak_reserved = torch.cuda.max_memory_reserved()
+        try:
+            free_memory, total_memory = torch.cuda.mem_get_info()
+            device_used = max(device_used, total_memory - free_memory)
+        except RuntimeError:
+            device_used = max(device_used, peak_reserved)
         elapsed_ms = (time.perf_counter() - start_time) * 1000.0 / max(1, iters)
+        delta = peak - baseline
+        delta_reserved = peak_reserved - baseline_reserved
+        delta_device = device_used - baseline_device
+
+        if torch.distributed.is_available() and torch.distributed.is_initialized():
+            stats = torch.tensor(
+                [
+                    float(baseline),
+                    float(peak),
+                    float(delta),
+                    float(baseline_reserved),
+                    float(peak_reserved),
+                    float(delta_reserved),
+                    float(baseline_device),
+                    float(device_used),
+                    float(delta_device),
+                    float(elapsed_ms),
+                ],
+                dtype=torch.float64,
+                device=f"cuda:{torch.cuda.current_device()}",
+            )
+            torch.distributed.all_reduce(stats, op=torch.distributed.ReduceOp.MAX)
+            (
+                baseline,
+                peak,
+                delta,
+                baseline_reserved,
+                peak_reserved,
+                delta_reserved,
+                baseline_device,
+                device_used,
+                delta_device,
+                elapsed_ms,
+            ) = stats.tolist()
 
         if torch.distributed.get_rank() == 0:
             print(
@@ -596,7 +677,13 @@ def run_single_dispatcher_benchmark(
                 f"topk={moe_router_topk} num_experts={num_moe_experts} "
                 f"ffn={moe_ffn_hidden_size} aux={moe_aux_loss_coeff} "
                 f"baseline={baseline / 1024**2:.2f}MiB "
-                f"peak={peak / 1024**2:.2f}MiB delta={(peak - baseline) / 1024**2:.2f}MiB "
+                f"peak={peak / 1024**2:.2f}MiB delta={delta / 1024**2:.2f}MiB "
+                f"reserved_baseline={baseline_reserved / 1024**2:.2f}MiB "
+                f"reserved_peak={peak_reserved / 1024**2:.2f}MiB "
+                f"reserved_delta={delta_reserved / 1024**2:.2f}MiB "
+                f"device_baseline={baseline_device / 1024**2:.2f}MiB "
+                f"device_used={device_used / 1024**2:.2f}MiB "
+                f"device_delta={delta_device / 1024**2:.2f}MiB "
                 f"time={elapsed_ms:.2f}ms"
             )
     finally:
@@ -665,11 +752,11 @@ def main() -> None:
     parser.add_argument("--aux-loss-coeff", type=float, default=0.01)
     parser.add_argument(
         "--recompute-mode",
-        choices=["moe", "full", "none"],
+        choices=["moe", "attn_moe", "full", "none"],
         default="moe",
         help=(
-            "Activation recompute policy. The default is selective MoE recompute, "
-            "which is the fair EP baseline for StreamMoE round checkpointing."
+            "Activation recompute policy. The default is selective MoE recompute; "
+            "attn_moe additionally checkpoints core attention for model-level comparisons."
         ),
     )
     parser.add_argument(
@@ -680,6 +767,11 @@ def main() -> None:
     )
     parser.add_argument("--warmup", type=int, default=2)
     parser.add_argument("--iters", type=int, default=5)
+    parser.add_argument(
+        "--sample-device-memory-peak",
+        action="store_true",
+        help="Poll device memory during the measured loop to approximate nvidia-smi peak used memory.",
+    )
     parser.add_argument(
         "--dtype", choices=["fp32", "bf16", "fp16"], default="fp32"
     )
@@ -718,6 +810,7 @@ def main() -> None:
             grad_accum_steps=args.grad_accum_steps,
             warmup=args.warmup,
             iters=args.iters,
+            sample_device_memory_peak=args.sample_device_memory_peak,
             **common_kwargs,
         )
 
