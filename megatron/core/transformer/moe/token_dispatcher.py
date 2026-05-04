@@ -153,11 +153,9 @@ class _StreamCombineBackwardWork:
 @dataclass
 class _StreamV2RoundStateWork:
     state: dict[str, Any]
-    x_work: _StreamAsyncAllToAll
-    acc_work: _StreamAsyncAllToAll
-    global_token_ids_work: _StreamAsyncAllToAll
+    x_acc_work: _StreamAsyncAllToAll
     remaining_probs_work: _StreamAsyncAllToAll
-    remaining_slot_ids_work: _StreamAsyncAllToAll
+    metadata_work: _StreamAsyncAllToAll
 
 
 @dataclass
@@ -1588,18 +1586,16 @@ class MoEStreamAlltoAllTokenDispatcherV2(MoEStreamAlltoAllTokenDispatcherV1):
     ) -> _StreamV2RoundStateWork:
         """Dispatch the compact V2 token state for one direct-flow round."""
 
-        x_work = self._launch_stream_v2_payload_dispatch(x, state)
-        acc_work = self._launch_stream_v2_payload_dispatch(acc, state)
-        global_token_ids_work = self._launch_stream_v2_payload_dispatch(global_token_ids, state)
+        x_acc = torch.cat((x, acc), dim=-1)
+        metadata = torch.cat((global_token_ids.reshape(-1, 1), remaining_slot_ids), dim=1)
+        x_acc_work = self._launch_stream_v2_payload_dispatch(x_acc, state)
         remaining_probs_work = self._launch_stream_v2_payload_dispatch(remaining_probs, state)
-        remaining_slot_ids_work = self._launch_stream_v2_payload_dispatch(remaining_slot_ids, state)
+        metadata_work = self._launch_stream_v2_payload_dispatch(metadata, state)
         return _StreamV2RoundStateWork(
             state=state,
-            x_work=x_work,
-            acc_work=acc_work,
-            global_token_ids_work=global_token_ids_work,
+            x_acc_work=x_acc_work,
             remaining_probs_work=remaining_probs_work,
-            remaining_slot_ids_work=remaining_slot_ids_work,
+            metadata_work=metadata_work,
         )
 
     def finish_stream_v2_round_dispatch(
@@ -1609,11 +1605,12 @@ class MoEStreamAlltoAllTokenDispatcherV2(MoEStreamAlltoAllTokenDispatcherV1):
         """Wait for one V2 token-state dispatch to arrive on the current expert rank."""
 
         self._restore_stream_state(work.state)
-        x = work.x_work.wait_current_stream()
-        acc = work.acc_work.wait_current_stream()
-        global_token_ids = work.global_token_ids_work.wait_current_stream()
+        x_acc = work.x_acc_work.wait_current_stream()
+        x, acc = torch.chunk(x_acc, 2, dim=-1)
         received_remaining_probs = work.remaining_probs_work.wait_current_stream()
-        received_remaining_slot_ids = work.remaining_slot_ids_work.wait_current_stream()
+        metadata = work.metadata_work.wait_current_stream()
+        global_token_ids = metadata[:, 0]
+        received_remaining_slot_ids = metadata[:, 1:]
         return _StreamV2TokenState(
             x=x,
             current_probs=received_remaining_probs[:, 0],

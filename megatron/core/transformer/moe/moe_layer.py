@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
-from typing import Optional, Protocol
+from typing import Any, Optional, Protocol
 
 import torch
 
@@ -221,15 +221,152 @@ class _StreamMoEOverlapCheckpoint(torch.autograd.Function):
         return None, hidden_states.grad, None
 
 
-class _StreamMoEV2FullRecomputeCheckpoint(torch.autograd.Function):
-    """Checkpoint V2 as one direct-flow segment.
+@dataclass
+class _StreamV2RoundTrace:
+    """Small metadata needed to replay a V2 round in custom backward."""
 
-    The previous V2 path checkpointed every round independently. That saved the
-    flowing ``x`` and ``acc`` tensors at every boundary, which defeats the point
-    of making the token state stream between experts. This diagnostic wrapper
-    saves only the original layer input and reconstructs the direct-flow segment
-    during backward.
+    dispatch_state: dict[str, Any]
+    global_token_ids: torch.Tensor
+    remaining_slot_ids: torch.Tensor
+    ordered_remaining_slot_ids: torch.Tensor
+
+
+class _StreamMoEV2ReverseCheckpoint(torch.autograd.Function):
+    """Checkpoint V2 and run a round-wise reverse transport in backward.
+
+    Forward saves the original home-rank input, the final flowing ``x`` value,
+    and compact dispatch metadata. Backward walks V2 rounds in reverse: it
+    recomputes only the current round's expert graph, then transports ``x`` and
+    ``acc`` gradients through the inverse dispatch to seed the previous round.
     """
+
+    @staticmethod
+    def forward(ctx, module, hidden_states, padding_mask):
+        ctx.module = module
+        ctx.has_padding_mask = padding_mask is not None
+        ctx.hidden_shape = tuple(hidden_states.shape)
+        ctx.num_tokens_per_home_rank = int(
+            hidden_states.reshape(-1, hidden_states.shape[-1]).shape[0]
+        )
+
+        with torch.no_grad():
+            final_x, final_acc, final_global_token_ids, round_traces = (
+                module._stream_v2_forward_pre_home(
+                    hidden_states,
+                    padding_mask,
+                    use_round_checkpoint=False,
+                    collect_round_traces=True,
+                )
+            )
+            output = module._stream_v2_home_combine_output(
+                final_acc,
+                final_global_token_ids,
+                hidden_states.shape,
+                ctx.num_tokens_per_home_rank,
+            )
+
+        ctx.round_traces = round_traces
+        if ctx.has_padding_mask:
+            ctx.save_for_backward(hidden_states, padding_mask, final_x, final_global_token_ids)
+        else:
+            ctx.save_for_backward(hidden_states, final_x, final_global_token_ids)
+        return output
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        module = ctx.module
+        saved_tensors = ctx.saved_tensors
+        hidden_states = saved_tensors[0].detach()
+        hidden_requires_grad = saved_tensors[0].requires_grad
+        hidden_states.requires_grad_(True)
+        if ctx.has_padding_mask:
+            padding_mask = saved_tensors[1]
+            final_x = saved_tensors[2].detach()
+            final_global_token_ids = saved_tensors[3].detach()
+        else:
+            padding_mask = None
+            final_x = saved_tensors[1].detach()
+            final_global_token_ids = saved_tensors[2].detach()
+
+        round_traces: list[_StreamV2RoundTrace] = ctx.round_traces
+        if not round_traces or final_x.numel() == 0:
+            ctx.module = None
+            ctx.round_traces = None
+            return None, torch.zeros_like(hidden_states) if hidden_requires_grad else None, None
+
+        num_tokens_per_home_rank = ctx.num_tokens_per_home_rank
+        with torch.enable_grad():
+            topk_probs, _ = module.route_compact(hidden_states, padding_mask)
+            topk_probs = topk_probs.reshape(num_tokens_per_home_rank, -1)
+            current_probs_by_round = module._stream_v2_trace_current_probs_by_round(
+                topk_probs,
+                round_traces,
+            )
+
+            final_acc = final_x.new_zeros(final_x.shape, requires_grad=True)
+            home_output = module._stream_v2_home_combine_output(
+                final_acc,
+                final_global_token_ids,
+                torch.Size(ctx.hidden_shape),
+                num_tokens_per_home_rank,
+            )
+            torch.autograd.backward(home_output, grad_output, retain_graph=True)
+            grad_acc = final_acc.grad.detach()
+
+            current_x_value = final_x
+            grad_x = None
+            for round_index in range(len(round_traces) - 1, -1, -1):
+                trace = round_traces[round_index]
+                current_x = current_x_value.detach().requires_grad_(True)
+                current_probs = current_probs_by_round[round_index]
+                module.token_dispatcher._restore_stream_state(trace.dispatch_state)
+                expert_output = module._stream_round_expert_output_from_dispatched(
+                    current_x,
+                    current_probs,
+                )
+                torch.autograd.backward(
+                    expert_output,
+                    grad_acc,
+                    retain_graph=round_index > 0,
+                )
+
+                current_grad_x = current_x.grad
+                if grad_x is not None:
+                    current_grad_x = (
+                        grad_x
+                        if current_grad_x is None
+                        else current_grad_x + grad_x.to(current_grad_x.dtype)
+                    )
+
+                if current_grad_x is None:
+                    current_grad_x = torch.zeros_like(current_x)
+                grad_x, grad_acc = module._stream_v2_inverse_dispatch_pair(
+                    current_grad_x,
+                    grad_acc,
+                    trace.dispatch_state,
+                    scatter_add=True,
+                )
+                if round_index > 0:
+                    current_x_value = module._stream_v2_inverse_dispatch_payload(
+                        current_x_value,
+                        trace.dispatch_state,
+                        scatter_add=False,
+                    )
+
+        hidden_grad = hidden_states.grad
+        if hidden_requires_grad:
+            x_grad = grad_x.reshape_as(hidden_states)
+            hidden_grad = x_grad if hidden_grad is None else hidden_grad + x_grad
+        else:
+            hidden_grad = None
+
+        ctx.module = None
+        ctx.round_traces = None
+        return None, hidden_grad, None
+
+
+class _StreamMoEV2FullRecomputeCheckpoint(torch.autograd.Function):
+    """Checkpoint V2 as one direct-flow segment."""
 
     @staticmethod
     def forward(ctx, module, hidden_states, padding_mask):
@@ -793,18 +930,33 @@ class MoELayer(BaseMoELayer):
         final round.
         """
 
-        token_dispatcher = self.token_dispatcher
-        assert isinstance(token_dispatcher, MoEStreamAlltoAllTokenDispatcherV2)
-        current_acc, current_global_token_ids = self._stream_v2_forward_pre_home(
+        _, current_acc, current_global_token_ids, _ = self._stream_v2_forward_pre_home(
             hidden_states,
             padding_mask,
             use_round_checkpoint=use_round_checkpoint,
         )
         flat_hidden_states = hidden_states.reshape(-1, hidden_states.shape[-1])
-        if current_acc.numel() == 0:
-            return torch.zeros_like(hidden_states)
-        num_tokens_per_home_rank = flat_hidden_states.shape[0]
+        return self._stream_v2_home_combine_output(
+            current_acc,
+            current_global_token_ids,
+            hidden_states.shape,
+            flat_hidden_states.shape[0],
+        )
 
+    def _stream_v2_home_combine_output(
+        self,
+        current_acc: torch.Tensor,
+        current_global_token_ids: torch.Tensor,
+        hidden_shape: torch.Size | tuple[int, ...],
+        num_tokens_per_home_rank: int,
+    ) -> torch.Tensor:
+        """Return V2's final accumulator to the home rank and restore token order."""
+
+        token_dispatcher = self.token_dispatcher
+        assert isinstance(token_dispatcher, MoEStreamAlltoAllTokenDispatcherV2)
+        hidden_shape = torch.Size(hidden_shape)
+        if current_acc.numel() == 0:
+            return current_acc.new_zeros(hidden_shape)
         home_combine_work = token_dispatcher.start_stream_v2_home_combine(
             current_acc,
             current_global_token_ids,
@@ -813,13 +965,13 @@ class MoELayer(BaseMoELayer):
         returned_acc, returned_global_token_ids = token_dispatcher.finish_stream_v2_home_combine(
             home_combine_work
         )
-        output = flat_hidden_states.new_zeros(flat_hidden_states.shape)
+        output = current_acc.new_zeros((num_tokens_per_home_rank, hidden_shape[-1]))
         returned_local_token_ids = torch.remainder(
             returned_global_token_ids,
             num_tokens_per_home_rank,
         ).to(torch.long)
         output.index_add_(0, returned_local_token_ids, returned_acc.to(output.dtype))
-        return output.view_as(hidden_states)
+        return output.view(hidden_shape)
 
     def _stream_v2_forward_pre_home(
         self,
@@ -827,14 +979,18 @@ class MoELayer(BaseMoELayer):
         padding_mask: Optional[torch.Tensor] = None,
         *,
         use_round_checkpoint: bool = True,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
+        collect_round_traces: bool = False,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, list[_StreamV2RoundTrace]]:
         """Run V2 rounds and return the pre-home-combine accumulator state."""
 
         topk_probs, topk_indices = self.route_compact(hidden_states, padding_mask)
         flat_hidden_states = hidden_states.reshape(-1, hidden_states.shape[-1])
         if topk_indices.numel() == 0:
-            return flat_hidden_states.new_zeros(flat_hidden_states.shape), flat_hidden_states.new_empty(
-                (0,), dtype=torch.int32
+            return (
+                flat_hidden_states.new_zeros(flat_hidden_states.shape),
+                flat_hidden_states.new_zeros(flat_hidden_states.shape),
+                flat_hidden_states.new_empty((0,), dtype=torch.int32),
+                [],
             )
 
         num_tokens_per_home_rank = flat_hidden_states.shape[0]
@@ -858,8 +1014,30 @@ class MoELayer(BaseMoELayer):
             .unsqueeze(0)
             .expand(num_tokens_per_home_rank, -1)
         )
+        round_traces: list[_StreamV2RoundTrace] = []
 
         for round_id in range(topk_indices.shape[1]):
+            if collect_round_traces:
+                (
+                    current_x,
+                    current_acc,
+                    current_global_token_ids,
+                    current_remaining_probs,
+                    current_remaining_slot_ids,
+                    round_trace,
+                ) = self._stream_v2_round_forward_with_trace(
+                    current_x,
+                    current_acc,
+                    current_global_token_ids,
+                    current_remaining_probs,
+                    current_remaining_slot_ids,
+                    topk_indices,
+                    round_id,
+                    num_tokens_per_home_rank,
+                )
+                round_traces.append(round_trace)
+                continue
+
             (
                 current_x,
                 current_acc,
@@ -890,9 +1068,9 @@ class MoELayer(BaseMoELayer):
                 )
             )
 
-        return current_acc, current_global_token_ids
+        return current_x, current_acc, current_global_token_ids, round_traces
 
-    def _stream_v2_round_forward(
+    def _stream_v2_round_forward_with_trace(
         self,
         current_x: torch.Tensor,
         current_acc: torch.Tensor,
@@ -902,8 +1080,15 @@ class MoELayer(BaseMoELayer):
         topk_indices: torch.LongTensor,
         round_id: int,
         num_tokens_per_home_rank: int,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Run one V2 direct-flow round and return the next token state."""
+    ) -> tuple[
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        _StreamV2RoundTrace,
+    ]:
+        """Run one V2 direct-flow round and record compact replay metadata."""
 
         token_dispatcher = self.token_dispatcher
         assert isinstance(token_dispatcher, MoEStreamAlltoAllTokenDispatcherV2)
@@ -934,12 +1119,57 @@ class MoELayer(BaseMoELayer):
             round_state.x,
             round_state.current_probs,
         )
+        round_trace = _StreamV2RoundTrace(
+            dispatch_state=dispatch_state,
+            global_token_ids=current_global_token_ids.detach(),
+            remaining_slot_ids=current_remaining_slot_ids.detach(),
+            ordered_remaining_slot_ids=ordered_remaining_slot_ids.detach(),
+        )
         return (
             next_x,
             next_acc,
             round_state.global_token_ids,
             round_state.remaining_probs,
             round_state.remaining_slot_ids,
+            round_trace,
+        )
+
+    def _stream_v2_round_forward(
+        self,
+        current_x: torch.Tensor,
+        current_acc: torch.Tensor,
+        current_global_token_ids: torch.Tensor,
+        current_remaining_probs: torch.Tensor,
+        current_remaining_slot_ids: torch.Tensor,
+        topk_indices: torch.LongTensor,
+        round_id: int,
+        num_tokens_per_home_rank: int,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Run one V2 direct-flow round and return the next token state."""
+
+        (
+            next_x,
+            next_acc,
+            next_global_token_ids,
+            next_remaining_probs,
+            next_remaining_slot_ids,
+            _,
+        ) = self._stream_v2_round_forward_with_trace(
+            current_x,
+            current_acc,
+            current_global_token_ids,
+            current_remaining_probs,
+            current_remaining_slot_ids,
+            topk_indices,
+            round_id,
+            num_tokens_per_home_rank,
+        )
+        return (
+            next_x,
+            next_acc,
+            next_global_token_ids,
+            next_remaining_probs,
+            next_remaining_slot_ids,
         )
 
     def _prepare_stream_v2_round_selection(
@@ -996,6 +1226,89 @@ class MoELayer(BaseMoELayer):
         round_slot_ids = ordered_remaining_slot_ids[:, 0].to(torch.long)
         round_expert_indices = current_topk_indices.gather(1, round_slot_ids.unsqueeze(1)).squeeze(1)
         return round_expert_indices, ordered_remaining_probs, ordered_remaining_slot_ids
+
+    def _stream_v2_trace_current_probs_by_round(
+        self,
+        topk_probs: torch.Tensor,
+        round_traces: list[_StreamV2RoundTrace],
+    ) -> list[torch.Tensor]:
+        """Replay V2's small gate-prob flow once and return each round's probs."""
+
+        token_dispatcher = self.token_dispatcher
+        assert isinstance(token_dispatcher, MoEStreamAlltoAllTokenDispatcherV2)
+
+        current_probs_by_round: list[torch.Tensor] = []
+        received_remaining_probs = topk_probs
+        for trace in round_traces:
+            remaining_slot_ids = trace.remaining_slot_ids.to(torch.long)
+            ordered_remaining_slot_ids = trace.ordered_remaining_slot_ids.to(torch.long)
+            reorder_positions = (
+                remaining_slot_ids.unsqueeze(1)
+                .eq(ordered_remaining_slot_ids.unsqueeze(2))
+                .to(torch.long)
+                .argmax(dim=2)
+            )
+            ordered_remaining_probs = received_remaining_probs.gather(1, reorder_positions)
+            probs_work = token_dispatcher._launch_stream_v2_payload_dispatch(
+                ordered_remaining_probs,
+                trace.dispatch_state,
+            )
+            received_remaining_probs = probs_work.wait_current_stream()
+            current_probs_by_round.append(received_remaining_probs[:, 0])
+            received_remaining_probs = received_remaining_probs[:, 1:]
+        return current_probs_by_round
+
+    def _stream_v2_inverse_dispatch_payload(
+        self,
+        payload: torch.Tensor,
+        state: dict[str, Any],
+        *,
+        scatter_add: bool,
+    ) -> torch.Tensor:
+        """Apply the inverse of one dense V2 dispatch to a payload or payload gradient."""
+
+        token_dispatcher = self.token_dispatcher
+        assert isinstance(token_dispatcher, MoEStreamAlltoAllTokenDispatcherV2)
+        if self.config.moe_stream_v2_sparse_comm:
+            raise NotImplementedError(
+                "StreamMoE v2 reverse checkpoint currently supports dense all-to-all only."
+            )
+
+        inverse_work = token_dispatcher._all_to_all_async(
+            payload,
+            state["input_splits"],
+            state["output_splits"],
+        )
+        permuted_payload = inverse_work.wait_current_stream()
+        permutation = state["reversed_local_input_permutation_mapping"].to(torch.long)
+        output_shape = (int(permutation.numel()),) + tuple(payload.shape[1:])
+        restored = payload.new_zeros(output_shape)
+        if scatter_add:
+            restored.index_add_(0, permutation, permuted_payload.to(restored.dtype))
+        else:
+            restored.index_copy_(0, permutation, permuted_payload.to(restored.dtype))
+        return restored
+
+    def _stream_v2_inverse_dispatch_pair(
+        self,
+        first_payload: torch.Tensor,
+        second_payload: torch.Tensor,
+        state: dict[str, Any],
+        *,
+        scatter_add: bool,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Apply one inverse dispatch to two same-shape payloads packed together."""
+
+        packed_payload = torch.cat((first_payload, second_payload), dim=-1)
+        restored = self._stream_v2_inverse_dispatch_payload(
+            packed_payload,
+            state,
+            scatter_add=scatter_add,
+        )
+        first_width = first_payload.shape[-1]
+        first_restored = restored[..., :first_width]
+        second_restored = restored[..., first_width:]
+        return first_restored, second_restored
 
     def _checkpoint_stream_v2_round(
         self,
@@ -1196,7 +1509,12 @@ class MoELayer(BaseMoELayer):
 
             if self.config.moe_stream_version == "v2":
                 if self.moe_layer_recompute:
-                    output = _StreamMoEV2FullRecomputeCheckpoint.apply(
+                    checkpoint = (
+                        _StreamMoEV2FullRecomputeCheckpoint
+                        if self.config.moe_stream_v2_sparse_comm
+                        else _StreamMoEV2ReverseCheckpoint
+                    )
+                    output = checkpoint.apply(
                         self,
                         hidden_states,
                         padding_mask,
